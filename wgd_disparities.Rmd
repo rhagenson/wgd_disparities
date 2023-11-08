@@ -1,0 +1,4553 @@
+---
+title: "An elevated rate of whole-genome duplication events in cancers from Black patients"
+subtitle: "Computational Analysis"
+author: "Ryan A. Hagenson"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    df_print: kable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  cache = TRUE,
+  autodep = TRUE,
+  cache.lazy = FALSE,
+  fig.width = 10,
+  fig.height = 7.75,
+  message = FALSE
+)
+```
+
+## Pre-analysis
+### Load Libraries
+```{r, message=FALSE, warning=FALSE}
+library(assertr)
+library(car)
+library(ComplexHeatmap)
+library(cowplot)
+library(DT)
+library(ggsurvfit)
+library(gt)
+library(EnhancedVolcano)
+library(gtsummary)
+library(maftools)
+library(openxlsx)
+library(reshape2)
+library(survival)
+library(tidyverse)
+```
+
+### Define Functions
+```{r}
+reduceModel <- function(model, cutoff = 4) {
+  selectedMod <- model
+  all_vifs <- as.data.frame(car::vif(selectedMod), keep.rownames = TRUE)
+  signif_all <- rownames(all_vifs)
+
+  while (any(all_vifs$GVIF > cutoff)) {
+    var_with_max_vif <-
+      rownames(all_vifs)[[which(all_vifs$GVIF == max(all_vifs$GVIF))]]  # get the var with max vif
+    signif_all <-
+      signif_all[!(signif_all) %in% var_with_max_vif]  # remove
+    myForm <-
+      as.formula(paste("is_wgd ~ ", paste (signif_all, collapse = " + "), sep =
+                         ""))  # new formula
+    selectedMod <-
+      glm(myForm,
+          family = binomial(link = 'logit'),
+          data = model$data)
+    all_vifs <-
+      as.data.frame(car::vif(selectedMod), keep.rownames = TRUE)
+  }
+  selectedMod
+}
+
+# Extract model variables
+extractModelVariables <- function(model) {
+  model.vars <-
+    as.data.frame(summary(model)$coefficients, keep.rownames = TRUE)
+
+  # Compute 95% confidence intervals for odds ratios
+  model.vars %>%
+    mutate(OR = exp(Estimate)) %>%
+    mutate(OR_lower = exp(Estimate - (1.96 * `Std. Error`)),
+           OR_upper = exp(Estimate + (1.96 * `Std. Error`))) %>%
+    arrange(`Pr(>|z|)`)
+}
+```
+
+### Define Constants
+```{r}
+percentMutated <- 0.02  # % of patients below which we no longer maintain a gene for analysis
+percentCNA <- 0.02  # % of patients below which we no longer maintain a gene for analysis
+nPatients <- 200  # Number of patients below which we no longer maintain a gene for analysis
+ignoreMutations <- c(
+    "Silent",
+    "Intron",
+    "5'UTR",
+    "3'Flank",
+    "5'Flank",
+    "3'UTR",
+    "IGR",
+    "RNA"
+)
+geneset <- read.csv("data/ref/impact-505.csv", stringsAsFactors = FALSE)$hugoGeneSymbol
+```
+
+### Load Data
+```{r load-data, message=FALSE, warning=FALSE}
+# Local data
+raw.data.wgd <-
+  read.csv("data/ref/MSK-WGD.csv", stringsAsFactors = FALSE)
+raw.data.ancestry <-
+  read_tsv("data/ref/msk-met-cell2022-ancestry.tsv",
+           col_types = cols(.default = "c"))
+raw.data.regional <-
+  read.csv('data/ref/regionalLN.csv', stringsAsFactors = FALSE)
+
+# Remotely available data (downloaded from cBioPortal)
+raw.data.clinical.patient <-
+  read_tsv(
+    "data/msk_met_2021/data_clinical_patient.txt",
+    skip = 4,
+    col_types = cols(.default = "c")
+  )
+raw.data.clinical.sample <-
+  read_tsv(
+    "data/msk_met_2021/data_clinical_sample.txt",
+    skip = 4,
+    col_types = cols(.default = "c")
+  )
+raw.data.cna <-
+  read.csv(
+    "data/msk_met_2021/data_cna.txt",
+    stringsAsFactors = FALSE,
+    sep = '\t',
+    check.names = FALSE
+  ) %>%
+  pivot_longer(cols = !c(Hugo_Symbol)) %>%
+  rename(HUGO_SYMBOL = Hugo_Symbol,
+         SAMPLE_ID = name,
+         CNA = value) %>%
+  mutate(CNA = as.numeric(CNA))
+raw.data.mutations <-
+  read_tsv("data/msk_met_2021/data_mutations.txt",
+           col_types = cols(.default = "c"))
+
+pcawg <-
+  read_csv(
+    "data/pcawg/pancan_pcawg_2020_clinical_data.csv",
+    col_select = c(
+      PATIENT_ID = `Patient ID`,
+      SAMPLE_ID = `Sample ID`,
+      SAMPLE_TYPE = `Sample Type`,
+      Ancestry = `Primary Ancestry`,
+      WGD = `Whole Genome Duplication`,
+      Cancer.Type = `Cancer Type`,
+      Cancer.Type.Detailed = `Cancer Type Detailed`,
+      Sex = Sex
+    )
+  ) %>%
+  mutate(is_wgd = WGD == 'wgd') %>%
+  # Only consider decidable samples
+  filter(
+    !is.na(is_wgd),
+    SAMPLE_TYPE == 'Primary',
+    str_detect(Ancestry, "EUR|AFR"),
+    str_detect(Sex, "Female|Male")
+  ) %>%
+  # Assertions of assumptions
+  assert(is_uniq, SAMPLE_ID, PATIENT_ID) %>%
+  assert(in_set(0, 1), is_wgd) %>%
+  assert(in_set("Female", "Male"), Sex) %>%
+  assert(in_set("AFR", "EUR"), Ancestry) %>%
+  verify(SAMPLE_TYPE == "Primary") %>%
+  assert(not_na, Cancer.Type, is_wgd, Sex, SAMPLE_TYPE, PATIENT_ID, SAMPLE_ID)
+tcga <-
+  read_csv(
+    "data/tcga/TCGA_Demographics.csv",
+    col_select = c(
+      PATIENT_ID = bcr_patient_barcode,
+      Group = race,
+      Oncotree = type,
+      Sex = gender,
+      Hist = histological_type
+    )
+  ) %>%
+  inner_join(
+    read_csv(
+      "data/tcga/TCGA_arm_scores.csv",
+      col_select = c(SAMPLE_ID = Sample, Genome_doublings)
+    ) %>%
+      # Only consider Primary tumors
+      filter(str_detect(SAMPLE_ID, "^.*-01$")) %>%
+      # Extract the patient ID
+      mutate(PATIENT_ID = str_extract(SAMPLE_ID, "\\w{4}-\\w{2}-\\w{4}")),
+    by = c("PATIENT_ID")
+  ) %>%
+  mutate(is_wgd = Genome_doublings > 0) %>%
+  mutate(Sex = str_to_title(Sex)) %>%
+  mutate(Group = case_when(
+    str_detect(Group, "BLACK") ~ "BLACK",
+    str_detect(Group, "WHITE") ~ "WHITE",
+    TRUE ~ "OTHER"
+  )) %>%
+  # Only consider decidable samples
+  filter(
+    !is.na(is_wgd),
+    str_detect(SAMPLE_ID, "^.*-01$"),
+    str_detect(Group, "WHITE|BLACK"),
+    str_detect(Sex, "Female|Male")
+  ) %>%
+  # Assertions of assumptions
+  assert(is_uniq, SAMPLE_ID, PATIENT_ID) %>%
+  assert(in_set(0, 1), is_wgd) %>%
+  assert(in_set("Female", "Male"), Sex) %>%
+  assert(in_set("WHITE", "BLACK"), Group) %>%
+  verify(str_detect(SAMPLE_ID, "^.*-01$")) %>%
+  assert(not_na, Oncotree, is_wgd, Sex, PATIENT_ID, SAMPLE_ID)
+```
+
+## Munge Data
+```{r}
+data.wgd.clean <- raw.data.wgd %>%
+  # Keep only columns/variables of interest
+  select(SAMPLE_ID = Sample.ID,
+         Sample.Type,
+         is_wgd,
+         MSI = MSI.Type,
+         Group = Race.Category,
+         Sex,
+         Cancer.Type,
+         Cancer.Type.Detailed) %>%
+  # Clean Group data
+  mutate(Group = case_when(
+    str_detect(Group, "Black") ~ "BLACK",
+    str_detect(Group, "White") ~ "WHITE",
+    TRUE ~ "OTHER"
+  )) %>%
+  # Clean WGD data
+  mutate(is_wgd = as.numeric(as.logical(is_wgd))) %>%
+  # Only consider decidable samples
+  filter(
+    !is.na(is_wgd),
+    Sample.Type == "Primary",
+    str_detect(Group, "WHITE|BLACK"),
+    str_detect(Sex, "Female|Male")
+  ) %>%
+  # Enforce data types
+  mutate(across(c(
+    Sample.Type, Group, Sex, Cancer.Type
+  ), factor)) %>%
+  # Assertions of assumptions
+  assert(is_uniq, SAMPLE_ID) %>%
+  assert(in_set(0, 1), is_wgd) %>%
+  assert(in_set("Female", "Male"), Sex) %>%
+  assert(in_set("WHITE", "BLACK"), Group) %>%
+  verify(Sample.Type == "Primary") %>%
+  assert(not_na, Cancer.Type, is_wgd, Sex, Sample.Type, SAMPLE_ID)
+
+data.wgd.ancestry.clean <- raw.data.wgd %>%
+  # Keep only columns/variables of interest
+  select(PATIENT_ID = Patient.ID,
+         SAMPLE_ID = Sample.ID,
+         Sample.Type,
+         is_wgd,
+         Sex,
+         Cancer.Type) %>%
+  # Add ancestry info
+  left_join(
+    raw.data.ancestry %>% select(Patient, ancestry_label, AFR, EUR),
+    by = c('PATIENT_ID' = 'Patient')
+  ) %>%
+  # Clean WGD data
+  mutate(is_wgd = as.numeric(as.logical(is_wgd))) %>%
+  # Only consider decidable samples
+  filter(
+    !is.na(is_wgd),
+    Sample.Type == "Primary",
+    str_detect(ancestry_label, "AFR|EUR"),
+    str_detect(Sex, "Female|Male")
+  ) %>%
+  # Enforce data types
+  mutate(across(c(
+    Sample.Type, ancestry_label, Sex, Cancer.Type
+  ), factor)) %>%
+  mutate(across(c(AFR, EUR), as.numeric)) %>%
+  # Assertions of assumptions
+  assert(is_uniq, SAMPLE_ID, PATIENT_ID) %>%
+  assert(in_set(0, 1), is_wgd) %>%
+  assert(in_set("Female", "Male"), Sex) %>%
+  assert(in_set("AFR", "EUR"), ancestry_label) %>%
+  verify(Sample.Type == "Primary") %>%
+  assert(within_bounds(0, 1), AFR, EUR) %>%
+  assert(not_na, Cancer.Type, is_wgd, Sex,Sample.Type, SAMPLE_ID)
+
+samples.w.data <- unique(data.wgd.clean$SAMPLE_ID)
+
+# Filter by available WGD data
+data.clinical.sample.clean <- raw.data.clinical.sample %>%
+  filter(SAMPLE_ID %in% samples.w.data) %>%
+  select(SAMPLE_ID, PATIENT_ID) %>%
+  # Assertions of assumptions
+  assert(is_uniq, PATIENT_ID, SAMPLE_ID)
+
+data.clinical.patient.clean <- raw.data.clinical.patient %>%
+  left_join(
+    data.clinical.sample.clean,
+    by = c("PATIENT_ID" = "PATIENT_ID")
+  )  %>%
+  filter(SAMPLE_ID %in% samples.w.data) %>%
+  # Enforce data types
+  mutate(across(contains("AGE_"), ~ as.numeric(.) %>% dyears)) %>%
+  mutate(across(c(OS_MONTHS), ~ as.numeric(.) %>% dmonths)) %>%
+  # Assertions of assumptions
+  assert(is_uniq, PATIENT_ID, SAMPLE_ID) %>%
+  assert(in_set("White", "Black or african american"), RACE) %>%
+  assert(in_set("1:DECEASED", "0:LIVING"), OS_STATUS)
+
+data.cna.clean <- raw.data.cna %>%
+  filter(SAMPLE_ID %in% samples.w.data, HUGO_SYMBOL %in% geneset) %>%
+  left_join(data.wgd.clean %>% select(SAMPLE_ID, Group),
+            by = c("SAMPLE_ID" = "SAMPLE_ID")) %>%
+  mutate(CNA = factor(
+    case_when(CNA < 0 ~ "_LOSS",
+              CNA == 0 ~ "WT",
+              CNA > 0 ~ "_GAIN"),
+    levels = c("WT", "_LOSS", "_GAIN")
+  )) %>%
+  pivot_wider(
+    id_cols = c(SAMPLE_ID, Group),
+    names_from = HUGO_SYMBOL,
+    values_from = CNA
+  ) %>%
+  group_split(Group) %>%
+  map(
+    ~ .x %>%
+      # Initial selection to avoid expanding bidirectional failures into GAIN/LOSS
+      select(SAMPLE_ID, where(
+        function(col)
+          is.factor(col) &&
+          (
+            sum(col != "WT") > (percentCNA * length(col)) ||
+              sum(col != "WT") >= nPatients
+          )
+      )) %>%
+      bind_cols(model.matrix(as.formula("~ ."), data = select(., where(
+        is.factor
+      ))) %>% as.data.frame()) %>%
+      select(SAMPLE_ID, contains("GAIN"), contains("LOSS")) %>%
+      # Final selection to keep only GAINs and LOSSes that pass our threshold
+      select(SAMPLE_ID, where(
+        function(col)
+          is.numeric(col) &&
+          (sum(col) >= (percentCNA * length(col)) || sum(col) >= nPatients)
+      ))
+  ) %>%
+  reduce(bind_rows) %>%
+  # Assertions of assumptions
+  assert(is_uniq, SAMPLE_ID) %>%
+  assert(in_set(0,1), contains("GAIN|LOSS"))
+
+data.mutations.clean <- raw.data.mutations %>%
+  select(Hugo_Symbol, SAMPLE_ID = Tumor_Sample_Barcode, Variant_Classification) %>%
+  # Remove symbols not in gene set
+  filter(Hugo_Symbol %in% geneset) %>%
+  # Only include mutations that affect the protein.
+  filter(!(Variant_Classification %in% ignoreMutations)) %>%
+  # Only samples with WGD data
+  filter(SAMPLE_ID %in% samples.w.data) %>%
+  count(SAMPLE_ID, Hugo_Symbol, name = "MUTATED") %>%
+  mutate(MUTATED = sign(MUTATED)) %>%
+  mutate(Hugo_Symbol = paste0(Hugo_Symbol, "_Mut")) %>%
+  # Assign each sample to a Group
+  inner_join(data.wgd.clean %>% select(SAMPLE_ID, Group),
+             by = c("SAMPLE_ID" = "SAMPLE_ID")) %>%
+  pivot_wider(
+    id_cols = c(SAMPLE_ID, Group),
+    names_from = Hugo_Symbol,
+    values_from = MUTATED,
+    values_fill = 0  # SAMPLE_ID appeared in sequencing data, but did not have qualifying mutation in given Hugo_Symbol
+  ) %>%
+  group_split(Group) %>%
+  map(~ .x %>% select(SAMPLE_ID, where(
+    function(col)
+      is.numeric(col) &&
+      (sum(col) >= (percentMutated * length(col)) ||
+         sum(col) >= nPatients)
+  ))) %>%
+  reduce(bind_rows) %>%
+  # Assertions of assumptions
+  assert(is_uniq, SAMPLE_ID) %>%
+  assert(in_set(0,1), contains("Mut"))
+```
+
+## WGD Rates by Self-report
+### Overall
+
+What is the rate of whole genome doubling by self-reported racial group?
+
+```{r}
+.tab <- table(data.wgd.clean$Group,
+              ifelse(data.wgd.clean$is_wgd == 1, "WGD", "NOT"))
+ComplexHeatmap::pheatmap(
+  .tab,
+  display_numbers = TRUE,
+  number_format = "%d",
+  fontsize = 14,
+  legend = FALSE,
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  color = rev(heat.colors(9)),
+  main = paste0(
+    "Overall\n(Fisher's p: ",
+    round(fisher.test(.tab)$p.value, digits = 5),
+    ")"
+  )
+)
+```
+
+### By Cancer
+
+What is the rate of whole genome doubling by self-reported racial group, by cancer?
+
+```{r, results = FALSE, fig.width = 12, fig.height = 15}
+lapply(sort(unique(data.wgd.clean$Cancer.Type)), function(c) {
+  tab <- data.wgd.clean %>%
+    filter(Cancer.Type == c) %>%
+    {
+      table(.$Group, ifelse(.$is_wgd == 1, "WGD", "NOT"))
+    }
+  ComplexHeatmap::pheatmap(
+    tab,
+    display_numbers = TRUE,
+    number_format = "%d",
+    fontsize = 14,
+    legend = FALSE,
+    cluster_rows = FALSE,
+    cluster_cols = FALSE,
+    color = rev(heat.colors(9)),
+    main = paste0(c, "\n(Fisher's p: ", round(fisher.test(tab)$p.value, digits = 5), ")")
+  ) %>%
+    ComplexHeatmap::draw() %>%
+    grid::grid.grabExpr()
+}) %>% plot_grid(plotlist = ., ncol = 3)
+```
+
+## WGD Rates by Ancestry
+### Overall
+
+What is the rate of whole genome doubling by ancestry?
+
+```{r}
+.tab <- table(data.wgd.ancestry.clean$ancestry_label,
+      ifelse(data.wgd.ancestry.clean$is_wgd == 1, "WGD", "NOT"))
+ComplexHeatmap::pheatmap(
+    .tab,
+    display_numbers = TRUE,
+    number_format = "%d",
+    fontsize = 14,
+    legend = FALSE,
+    cluster_rows = FALSE,
+    cluster_cols = FALSE,
+    color = rev(heat.colors(9)),
+    main = paste0("Overall\n(Fisher's p: ", round(fisher.test(.tab)$p.value, digits = 5), ")")
+  )
+```
+
+### By Cancer
+
+What is the rate of whole genome doubling by ancestry, by cancer?
+
+```{r, results = FALSE, fig.width = 12, fig.height = 15}
+lapply(sort(unique(data.wgd.ancestry.clean$Cancer.Type)), function(c) {
+  tab <- data.wgd.ancestry.clean %>%
+    filter(Cancer.Type == c) %>%
+    {
+      table(.$ancestry_label, ifelse(.$is_wgd == 1, "WGD", "NOT"))
+    }
+  ComplexHeatmap::pheatmap(
+    tab,
+    display_numbers = TRUE,
+    number_format = "%d",
+    fontsize = 14,
+    legend = FALSE,
+    cluster_rows = FALSE,
+    cluster_cols = FALSE,
+    color = rev(heat.colors(9)),
+    main = paste0(c, "\n(Fisher's p: ", round(fisher.test(tab)$p.value, digits = 5), ")")
+  ) %>%
+    ComplexHeatmap::draw() %>%
+    grid::grid.grabExpr()
+}) %>% plot_grid(plotlist = ., ncol = 3)
+```
+
+## Self-reported Racial Category: Logistic Regression
+```{r}
+gene.cna <- data.wgd.clean %>%
+  select(SAMPLE_ID, is_wgd, Group, SAMPLE_ID) %>%
+  left_join(data.cna.clean, by = "SAMPLE_ID") %>%
+  split(f = as.factor(.$Group)) %>%
+  map(~ .x %>%
+        select(is_wgd, SAMPLE_ID, where(function(col)
+          is.numeric(col) && !all(is.na(
+            col
+          )))))
+
+gene.mutation <- data.wgd.clean %>%
+  select(SAMPLE_ID, is_wgd, Group, SAMPLE_ID) %>%
+  left_join(data.mutations.clean,
+            by = "SAMPLE_ID") %>%
+  split(f = as.factor(.$Group)) %>%
+  map(~ .x %>%
+        select(is_wgd, SAMPLE_ID, where(function(col)
+          is.numeric(col) && !all(is.na(
+            col
+          )))))
+```
+
+Following the method of: http://www.nature.com/articles/s41588-018-0165-1
+
+Model reduction was via recursively computing variance inflation factor and removing VIF > 4 variables one at a time. This has the effect of removing colinear features.
+
+```{r}
+features.white <- data.wgd.clean %>%
+  select(SAMPLE_ID, is_wgd, Cancer.Type) %>%
+  inner_join(gene.cna$WHITE, by =  c("SAMPLE_ID", "is_wgd")) %>%
+  inner_join(gene.mutation$WHITE, by =  c("SAMPLE_ID", "is_wgd")) %>%
+  select(-SAMPLE_ID)
+
+features.black <- data.wgd.clean %>%
+  select(SAMPLE_ID, is_wgd, Cancer.Type) %>%
+  inner_join(gene.cna$BLACK, by =  c("SAMPLE_ID", "is_wgd")) %>%
+  inner_join(gene.mutation$BLACK, by =  c("SAMPLE_ID", "is_wgd")) %>%
+  select(-SAMPLE_ID)
+
+# Run logistic regression
+model.full.white <-
+  glm(is_wgd ~ ., family = binomial(link = 'logit'), data = features.white)
+model.full.black <-
+  glm(is_wgd ~ ., family = binomial(link = 'logit'), data = features.black)
+
+# Reduce model based on variance inflation factor cutoff
+model.reduced.white <- reduceModel(model.full.white, cutoff = 4)
+model.reduced.black <- reduceModel(model.full.black, cutoff = 4)
+
+# Extract model variables
+model.full.white.vars <- extractModelVariables(model.full.white)
+model.reduced.white.vars <- extractModelVariables(model.reduced.white)
+model.full.black.vars <- extractModelVariables(model.full.black)
+model.reduced.black.vars <- extractModelVariables(model.reduced.black)
+```
+
+### White, Full Model
+```{r}
+model.full.white.vars %>%
+  arrange(desc(`z value`)) %>%
+  datatable(
+    extensions = 'Buttons',
+    options = list(
+      dom = 'Blfrtip',
+      buttons = c('csv'),
+      lengthMenu = list(c(10, 25, 50, -1),
+                        c(10, 25, 50, "All"))
+    )
+  )
+```
+### White, Reduced Model
+```{r}
+model.reduced.white.vars %>%
+  arrange(desc(`z value`)) %>%
+  datatable(
+    extensions = 'Buttons',
+    options = list(
+      dom = 'Blfrtip',
+      buttons = c('csv'),
+      lengthMenu = list(c(10, 25, 50, -1),
+                        c(10, 25, 50, "All"))
+    )
+  )
+```
+
+### Black, Full Model
+```{r}
+model.full.black.vars %>%
+  arrange(desc(`z value`)) %>%
+  datatable(
+    extensions = 'Buttons',
+    options = list(
+      dom = 'Blfrtip',
+      buttons = c('csv'),
+      lengthMenu = list(c(10, 25, 50,-1),
+                        c(10, 25, 50, "All"))
+    )
+  )
+```
+
+### Black, Reduced Model
+```{r}
+model.reduced.black.vars %>%
+  arrange(desc(`z value`)) %>%
+  datatable(
+    extensions = 'Buttons',
+    options = list(
+      dom = 'Blfrtip',
+      buttons = c('csv'),
+      lengthMenu = list(c(10, 25, 50,-1),
+                        c(10, 25, 50, "All"))
+    )
+  )
+```
+
+## Ancestry Logistic Regression
+### Gather Data
+
+Gather Data Based on Feature Categories:
+
++ CNA, gene-level
++ Gene mutation
+
+```{r}
+gene.ancestry.cna <- data.wgd.ancestry.clean %>%
+  select(SAMPLE_ID, is_wgd, ancestry_label, SAMPLE_ID) %>%
+  left_join(data.cna.clean, by = "SAMPLE_ID") %>%
+  split(f = as.factor(.$ancestry_label)) %>%
+  map( ~ .x %>%
+         select(is_wgd, SAMPLE_ID, where(function(col)
+           is.numeric(col) && !all(is.na(
+             col
+           )))))
+
+gene.ancestry.mutation <- data.wgd.ancestry.clean %>%
+  select(SAMPLE_ID, is_wgd, ancestry_label, SAMPLE_ID) %>%
+  left_join(data.mutations.clean,
+            by = "SAMPLE_ID") %>%
+  split(f = as.factor(.$ancestry_label)) %>%
+  map( ~ .x %>%
+         select(is_wgd, SAMPLE_ID, where(function(col)
+           is.numeric(col) && !all(is.na(
+             col
+           )))))
+```
+
+Following the method of: http://www.nature.com/articles/s41588-018-0165-1
+
+Model reduction was via recursively computing variance inflation factor and removing VIF > 4 variables one at a time. This has the effect of removing colinear features.
+
+Manually removed features and reason:
+
++ `FGF4_GAIN` and `FGF19_GAIN` both alias `FGF3_GAIN` (i.e., correlation of 1)
+    - `FGF3` is a stable symbol and therefore was chosen to represent this subset of gains
+
+```{r}
+features.ancestry.eur <- data.wgd.ancestry.clean %>%
+  select(SAMPLE_ID, is_wgd, Cancer.Type) %>%
+  inner_join(gene.ancestry.cna$EUR, by =  c("SAMPLE_ID", "is_wgd")) %>%
+  inner_join(gene.ancestry.mutation$EUR, by =  c("SAMPLE_ID", "is_wgd")) %>%
+  select(-SAMPLE_ID) %>%
+  # Remove features without multiple levels -- unfit for logistic regression
+  select(where( ~ n_distinct(., na.rm = TRUE) > 1)) %>%
+  mutate(Cancer.Type = fct_drop(Cancer.Type)) %>%
+  # Remove feature with mostly NAs
+  select(where(~ sum(!is.na(.x)) > (length(.x) / 2)))
+
+features.ancestry.afr <- data.wgd.ancestry.clean %>%
+  select(SAMPLE_ID, is_wgd, Cancer.Type) %>%
+  inner_join(gene.ancestry.cna$AFR, by =  c("SAMPLE_ID", "is_wgd")) %>%
+  inner_join(gene.ancestry.mutation$AFR, by =  c("SAMPLE_ID", "is_wgd")) %>%
+  select(-SAMPLE_ID) %>%
+  # Remove features without multiple levels -- unfit for logistic regression
+  select(where( ~ n_distinct(., na.rm = TRUE) > 1)) %>%
+  mutate(Cancer.Type = fct_drop(Cancer.Type)) %>%
+  # Remove feature with mostly NAs
+  select(where(~ sum(!is.na(.x)) > (length(.x) / 2))) %>%
+  # Remove aliased covariates to FGF3_GAIN
+  # FGF3_GAIN is kept as it is a stable symbol
+  select(-FGF4_GAIN,-FGF19_GAIN)
+
+# Run logistic regression
+model.full.ancestry.eur <- glm(is_wgd ~ ., family = binomial(link = 'logit'), data = features.ancestry.eur)
+model.full.ancestry.afr <- glm(is_wgd ~ ., family = binomial(link = 'logit'), data = features.ancestry.afr)
+
+# Reduce model based on variance inflation factor cutoff
+model.reduced.ancestry.eur <- reduceModel(model.full.ancestry.eur, cutoff = 4)
+model.reduced.ancestry.afr <- reduceModel(model.full.ancestry.afr, cutoff = 4)
+
+# Extract model variables
+model.full.ancestry.eur.vars <- extractModelVariables(model.full.ancestry.eur)
+model.reduced.ancestry.eur.vars <- extractModelVariables(model.reduced.ancestry.eur)
+model.full.ancestry.afr.vars <- extractModelVariables(model.full.ancestry.afr)
+model.reduced.ancestry.afr.vars <- extractModelVariables(model.reduced.ancestry.afr)
+```
+
+### EUR, Full Model
+```{r}
+model.full.ancestry.eur.vars %>%
+  arrange(desc(`z value`)) %>%
+  datatable(
+    extensions = 'Buttons',
+    options = list(
+      dom = 'Blfrtip',
+      buttons = c('csv'),
+      lengthMenu = list(c(10, 25, 50, -1),
+                        c(10, 25, 50, "All"))
+    )
+  )
+```
+
+### EUR, Reduced Model
+```{r}
+model.reduced.ancestry.eur.vars %>%
+  arrange(desc(`z value`)) %>%
+  datatable(
+    extensions = 'Buttons',
+    options = list(
+      dom = 'Blfrtip',
+      buttons = c('csv'),
+      lengthMenu = list(c(10, 25, 50, -1),
+                        c(10, 25, 50, "All"))
+    )
+  )
+```
+
+### AFR, Full Model
+```{r}
+model.full.ancestry.afr.vars %>%
+  arrange(desc(`z value`)) %>%
+  datatable(
+    extensions = 'Buttons',
+    options = list(
+      dom = 'Blfrtip',
+      buttons = c('csv'),
+      lengthMenu = list(c(10, 25, 50, -1),
+                        c(10, 25, 50, "All"))
+    )
+  )
+```
+
+### AFR, Reduced Model
+```{r}
+model.reduced.ancestry.afr.vars %>%
+  arrange(desc(`z value`)) %>%
+  datatable(
+    extensions = 'Buttons',
+    options = list(
+      dom = 'Blfrtip',
+      buttons = c('csv'),
+      lengthMenu = list(c(10, 25, 50, -1),
+                        c(10, 25, 50, "All"))
+    )
+  )
+```
+
+## Manuscript Figures
+### Figure 1
+#### Figure 1B
+```{r}
+tmp <- data.wgd.clean %>%
+  count(Group, is_wgd) %>%
+  group_by(Group) %>%
+  mutate(pct = prop.table(n)) %>%
+  mutate(Source = "MSK-MET")
+
+tests <- tmp %>%
+  group_by(Source) %>%
+  group_modify(~ {
+    .x %>%
+    acast(is_wgd ~ Group, value.var = 'n') %>%
+      chisq.test(correct = FALSE) %>%
+      broom::tidy()
+    }) %>%
+  mutate(label = paste0("p = ", round(p.value, digits = 3)))
+
+tmp %>%
+  filter(is_wgd == 1) %>%
+  ggplot() +
+  aes(
+    x = Source,
+    y = pct,
+    fill = Group,
+    label = scales::percent(pct, accuracy = 0.1)
+  ) +
+  geom_bar(stat = 'identity', position = 'dodge') +
+  geom_text(position = position_dodge(width = .9),
+            vjust = -0.5,
+            size = 6) +
+  geom_text(
+    data = tests,
+    mapping = aes(x = Source, y = -0.005, label = label),
+    vjust = 1,
+    position = position_dodge(width = .9),
+    inherit.aes = FALSE,
+    size = 6
+  ) +
+  labs(y = 'Frequency of WGD',
+       title = 'Pan-cancer MSK-MET: WGD Frequency') +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     breaks = seq(0, 1, 0.1)) +
+  # Color matching
+  scale_fill_manual(values = c('BLACK' = '#6ad8f7', 'WHITE' = '#ff7879')) +
+  theme_gray(base_size = 16) +
+  theme(axis.title.x = element_blank())
+
+tests
+```
+
+#### Figure 1C
+```{r}
+tmp <- tcga %>%
+  count(Group, is_wgd) %>%
+  group_by(Group) %>%
+  mutate(pct = prop.table(n)) %>%
+  mutate(Source = "TCGA")
+
+tests <- tmp %>%
+  group_by(Source) %>%
+  group_modify(~ {
+    .x %>%
+    acast(is_wgd ~ Group, value.var = 'n') %>%
+      chisq.test(correct = FALSE) %>%
+      broom::tidy()
+    }) %>%
+  mutate(label = paste0("p = ", round(p.value, digits = 3)))
+
+tmp %>%
+  filter(is_wgd == 1) %>%
+  ggplot() +
+  aes(
+    x = Source,
+    y = pct,
+    fill = Group,
+    label = scales::percent(pct, accuracy = 0.1)
+  ) +
+  geom_bar(stat = 'identity', position = 'dodge') +
+  geom_text(position = position_dodge(width = .9),
+            vjust = -0.5,
+            size = 6) +
+  geom_text(
+    data = tests,
+    mapping = aes(x = Source, y = -0.005, label = label),
+    vjust = 1,
+    position = position_dodge(width = .9),
+    inherit.aes = FALSE,
+    size = 6
+  ) +
+  labs(y = 'Frequency of WGD',
+       title = 'Pan-cancer TCGA: WGD Frequency') +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     breaks = seq(0, 1, 0.1)) +
+  # Color matching
+  scale_fill_manual(values = c('BLACK' = '#6ad8f7', 'WHITE' = '#ff7879')) +
+  theme_gray(base_size = 16) +
+  theme(axis.title.x = element_blank())
+
+tests
+```
+
+#### Figure 1D
+```{r}
+tmp <- pcawg %>%
+  count(Ancestry, is_wgd) %>%
+  group_by(Ancestry) %>%
+  mutate(pct = prop.table(n)) %>%
+  mutate(Source = "PCAWG")
+
+tests <- tmp %>%
+  group_by(Source) %>%
+  group_modify(~ {
+    .x %>%
+      acast(is_wgd ~ Ancestry, value.var = 'n', fill = 0) %>%
+      chisq.test(correct = FALSE) %>%
+      broom::tidy()
+  }) %>%
+  mutate(label = paste0("p = ", round(p.value, digits = 3)))
+
+tmp %>%
+  filter(is_wgd == 1) %>%
+  ggplot() +
+  aes(x = Source, y = pct, fill = Ancestry, label = scales::percent(pct, accuracy = 0.1)) +
+  geom_bar(stat = 'identity', position = 'dodge') +
+  geom_text(position = position_dodge(width = .9),
+            vjust = -0.5,
+            size = 6) +
+  geom_text(
+    data = tests,
+    mapping = aes(x = Source, y = -0.01, label = label),
+    vjust = 1,
+    position = position_dodge(width = .9),
+    inherit.aes = FALSE,
+    size = 6
+  ) +
+  labs(y = 'Frequency of WGD',
+       title = 'Pan-cancer PCAWG: WGD Frequency') +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     breaks = seq(0, 1, 0.1)) +
+  # Color matching
+  scale_fill_manual(values = c('AFR' = '#6ad8f7', 'EUR' = '#ff7879')) +
+  theme_gray(base_size = 16) +
+  theme(axis.title.x = element_blank())
+
+tests
+```
+
+#### Figure 1E
+```{r}
+tmp <- data.wgd.clean %>%
+  filter(
+    Cancer.Type %in% c(
+      "Breast Cancer",
+      "Endometrial Cancer",
+      "Non-Small Cell Lung Cancer"
+    ),
+    !str_detect(Cancer.Type.Detailed, "Uterine Carcinosarcoma")
+  ) %>%
+  mutate(Type = fct_collapse(
+    Cancer.Type,
+    `Breast` = c("Breast Cancer"),
+    `Endometrial` = c("Endometrial Cancer"),
+    `NSCLC` = c("Non-Small Cell Lung Cancer")
+  )) %>%
+  count(Group, Type, is_wgd) %>%
+  group_by(Group, Type) %>%
+  mutate(pct = prop.table(n)) %>%
+  mutate(Source = "MSK-MET") %>%
+  bind_rows(
+    tcga %>%
+      filter(
+        Oncotree %in% c(
+          "BRCA",
+          "UCEC",
+          "LUAD",
+          "LUSC"
+        )
+      ) %>%
+      mutate(Type = fct_collapse(
+        Oncotree,
+        `Breast` = c("BRCA"),
+        `Endometrial` = c("UCEC"),
+        `NSCLC` = c("LUAD", "LUSC")
+      )) %>%
+      count(Group, Type, is_wgd) %>%
+      group_by(Group, Type) %>%
+      mutate(pct = prop.table(n)) %>%
+      mutate(Source = "TCGA")
+  )
+
+tests <- tmp %>%
+  group_by(Source, Type) %>%
+  group_modify(~ {
+    .x %>%
+    acast(is_wgd ~ Group, value.var = 'n') %>%
+      chisq.test(correct = FALSE) %>%
+      broom::tidy()
+    }) %>%
+  mutate(label = paste0("p = ", round(p.value, digits = 3)))
+
+tmp %>%
+  filter(is_wgd == 1) %>%
+  ggplot() +
+  aes(
+    x = Source,
+    y = pct,
+    fill = Group,
+    label = scales::percent(pct, accuracy = 0.1)
+  ) +
+  geom_bar(stat = 'identity', position = 'dodge') +
+  geom_text(position = position_dodge(width = .9),
+            vjust = -0.5,
+            size = 6) +
+  geom_text(
+    data = tests,
+    mapping = aes(x = Source, y = -0.005, label = label),
+    vjust = 1,
+    position = position_dodge(width = .9),
+    inherit.aes = FALSE,
+    size = 6
+  ) +
+  labs(y = 'Frequency of WGD',
+       title = 'WGD Frequency by Cancer Type') +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     breaks = seq(0, 1, 0.1)) +
+  # Color matching
+  scale_fill_manual(values = c('BLACK' = '#6ad8f7', 'WHITE' = '#ff7879')) +
+  theme_gray(base_size = 16) +
+  theme(axis.title.x = element_blank()) +
+  facet_wrap(~ Type)
+
+tests
+```
+
+
+### Figure 2
+```{r}
+gene.cna <- data.wgd.clean %>%
+  select(SAMPLE_ID, is_wgd, Group, SAMPLE_ID) %>%
+  left_join(data.cna.clean, by = "SAMPLE_ID") %>%
+  select(is_wgd, SAMPLE_ID, where(function(col)
+          is.numeric(col) && !all(is.na(
+            col
+          ))))
+
+gene.mutation <- data.wgd.clean %>%
+  select(SAMPLE_ID, is_wgd, Group, SAMPLE_ID) %>%
+  left_join(data.mutations.clean,
+            by = "SAMPLE_ID") %>%
+  select(is_wgd, SAMPLE_ID, where(function(col)
+          is.numeric(col) && !all(is.na(
+            col
+          ))))
+
+features.all <- data.wgd.clean %>%
+  select(SAMPLE_ID, is_wgd, Cancer.Type) %>%
+  inner_join(gene.cna, by =  c("SAMPLE_ID", "is_wgd")) %>%
+  inner_join(gene.mutation, by =  c("SAMPLE_ID", "is_wgd")) %>%
+  select(-SAMPLE_ID) %>%
+  # Remove features without multiple levels -- unfit for logistic regression
+  select(where( ~ n_distinct(., na.rm = TRUE) > 1)) %>%
+  mutate(Cancer.Type = fct_drop(Cancer.Type)) %>%
+  # Remove feature with mostly NAs
+  select(where(~ sum(!is.na(.x)) > (length(.x) / 2))) %>%
+  # Remove aliased covariates to FGF3_GAIN
+  # FGF3_GAIN is kept as it is a stable symbol
+  select(-FGF4_GAIN, -FGF19_GAIN)
+```
+
+Following the method of: http://www.nature.com/articles/s41588-018-0165-1
+
+Model reduction was via recursively computing variance inflation factor and removing VIF > 4 variables one at a time. This has the effect of removing colinear features.
+
+```{r}
+# Run logistic regression
+model.full.all <-
+  glm(is_wgd ~ ., family = binomial(link = 'logit'), data = features.all)
+
+# Reduce model based on variance inflation factor cutoff
+model.reduced.all <- reduceModel(model.full.all, cutoff = 4)
+
+# Extract model variables
+model.full.all.vars <- extractModelVariables(model.full.all)
+model.reduced.all.vars <- extractModelVariables(model.reduced.all)
+```
+
+#### Figure 2A
+```{r}
+model.reduced.all.vars %>%
+  rownames_to_column('Abberation') %>%
+  filter(!str_detect(Abberation, "Intercept")) %>%
+  mutate(X = log(OR),
+         Y = `Pr(>|z|)`,
+         Abberation = str_replace(Abberation, "_", " ")) %>%
+  column_to_rownames('Abberation') %>%
+  EnhancedVolcano::EnhancedVolcano(
+    lab = rownames(.),
+    x = 'X',
+    y = 'Y',
+    FCcutoff = log(1),
+    boxedLabels = TRUE,
+    title = md("WGD Genomic Correlates"),
+    subtitle = 'All Patients',
+    xlab = 'log(OR)',
+    legendLabels = c(
+      "NS",
+      expression(NS),
+      expression(p < 1e-05),
+      expression(p < 1e-05)
+    ),
+    pCutoff = 1e-05,
+    drawConnectors = TRUE,
+    arrowheads = FALSE,
+    lengthConnectors = unit(10, "npc"),
+    widthConnectors = 2,
+    pointSize = 5,
+    labSize = 10,
+    xlim = c(-1.1, 1.1),
+    legendLabSize = 30,
+    axisLabSize = 30,
+    caption = '',
+    directionConnectors = 'both',
+    max.overlaps = Inf
+  )
+```
+
+#### Figure 2B
+```{r, warning=FALSE}
+model.reduced.black.vars %>%
+  rownames_to_column('Abberation') %>%
+  filter(!str_detect(Abberation, "Intercept")) %>%
+  mutate(Q = p.adjust(`Pr(>|z|)`, method = 'fdr')) %>%
+  slice_max(order_by = `z value`, n = 10) %>%
+  mutate(across(contains("OR"), ~ round(., digits = 2))) %>%
+  rowwise() %>%
+  mutate(CI = paste(OR_lower, OR_upper, sep = ", ")) %>%
+  ungroup() %>%
+  mutate(Gene = str_extract(Abberation, "(.+)_(.+)", group = 1),
+         Event = str_to_title(str_extract(Abberation, "(.+)_(.+)", group = 2))) %>%
+  select(
+    Gene = Gene,
+    Event = Event,
+    `OR` = OR,
+    `95% CI` = CI,
+    `q-value` = Q
+  ) %>%
+  gt() %>%
+  tab_header(title = md("**Genomic Correlates of WGD: Black Patients**")) %>%
+  tab_footnote(locations = cells_column_labels(columns = c(`OR`, `95% CI`)),
+               footnote = "OR = Odds Ratio, CI = Confidence Interval") %>%
+  fmt(
+    columns = `q-value`,
+    fns = function(q)
+      gtsummary::style_pvalue(q,
+                              decimals = 3)
+  ) %>%
+  tab_style(
+    style = list(
+      cell_text(weight = 'bold')
+      ),
+    locations = cells_body(
+      columns = `q-value`,
+      rows = `q-value` < 0.05
+    )
+  ) %>%
+  opt_stylize(style = 1, color = 'gray') %>%
+  opt_table_font(font = 'Arial')
+```
+
+#### Figure 2C
+```{r}
+model.reduced.white.vars %>%
+  rownames_to_column('Abberation') %>%
+  filter(!str_detect(Abberation, "Intercept")) %>%
+  mutate(Q = p.adjust(`Pr(>|z|)`, method = 'fdr')) %>%
+  slice_max(order_by = `z value`, n = 10) %>%
+  mutate(across(contains("OR"), ~ round(., digits = 2))) %>%
+  rowwise() %>%
+  mutate(CI = paste(OR_lower, OR_upper, sep = ", ")) %>%
+  ungroup() %>%
+  mutate(Gene = str_extract(Abberation, "(.+)_(.+)", group = 1),
+         Event = str_to_title(str_extract(Abberation, "(.+)_(.+)", group = 2))) %>%
+  select(
+    Gene = Gene,
+    Event = Event,
+    `OR` = OR,
+    `95% CI` = CI,
+    `q-value` = Q
+  ) %>%
+  gt() %>%
+  tab_header(title = md("**Genomic Correlates of WGD: White Patients**")) %>%
+  tab_footnote(locations = cells_column_labels(columns = c(`OR`, `95% CI`)),
+               footnote = "OR = Odds Ratio, CI = Confidence Interval") %>%
+  fmt(
+    columns = `q-value`,
+    fns = function(q)
+      gtsummary::style_pvalue(q,
+                              decimals = 3)
+  ) %>%
+  tab_style(
+    style = list(
+      cell_text(weight = 'bold')
+      ),
+    locations = cells_body(
+      columns = `q-value`,
+      rows = `q-value` < 0.05
+    )
+  ) %>%
+  opt_stylize(style = 1, color = 'gray') %>%
+  opt_table_font(font = 'Arial')
+```
+
+#### Figure 2D
+```{r}
+.df <- data.wgd.clean %>%
+  select(SAMPLE_ID, Group) %>%
+  # Assign each sample to Group
+  left_join(data.mutations.clean %>% select(SAMPLE_ID, TP53_Mut),
+            by = c("SAMPLE_ID" = "SAMPLE_ID"))
+
+tests <- .df %>%
+  count(TP53_Mut, Group) %>%
+  acast(Group ~ TP53_Mut,
+        value.var = 'n',
+        fill = 0) %>%
+  chisq.test(correct = FALSE) %>%
+  broom::tidy() %>%
+  mutate(label = paste0("p = ", round(p.value, digits = 3)))
+
+.df %>%
+  group_by(Group) %>%
+  summarize(
+    Mut = sum(TP53_Mut, na.rm = TRUE),
+    Tot = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(Freq = Mut / Tot) %>%
+  ungroup() %>%
+  ggplot() +
+  aes(x = Group, y = Freq, fill = Group, label = scales::percent(Freq, accuracy = 0.1)) +
+  geom_bar(position = 'dodge', stat = 'identity') +
+  geom_text(position = position_dodge(width = .9),
+            vjust = -0.5,
+            size = 6) +
+  geom_text(
+    data = tests,
+    mapping = aes(x = 1.5, y = -0.01, label = label),
+    vjust = 1,
+    position = position_dodge(width = .9),
+    inherit.aes = FALSE,
+    size = 6
+  ) +
+  labs(title = "TP53 Mutation Frequency by Racial Group",
+       y = "Percentage",
+       x = "Racial Group",
+       fill = "Group") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     breaks = seq(0, 1, 0.1)) +
+  # Color matching
+  scale_fill_manual(values = c('BLACK' = '#6ad8f7', 'WHITE' = '#ff7879')) +
+  theme_gray(base_size = 18) +
+  theme(axis.text.x = element_text(
+    angle = 45,
+    vjust = 1,
+    hjust = 1
+  ),
+  legend.position = 'none')
+
+tests
+```
+
+#### Figure 2E
+```{r}
+.df <- data.wgd.clean %>%
+  select(SAMPLE_ID, Group, Cancer.Type, Cancer.Type.Detailed) %>%
+  filter(
+    Cancer.Type %in% c(
+      "Breast Cancer",
+      "Endometrial Cancer",
+      "Non-Small Cell Lung Cancer"
+    ),
+    !str_detect(Cancer.Type.Detailed, "Uterine Carcinosarcoma")
+  ) %>%
+  mutate(Type = fct_drop(
+    fct_collapse(
+      Cancer.Type,
+      `Breast` = c("Breast Cancer"),
+      `Endometrial` = c("Endometrial Cancer"),
+      `NSCLC` = c("Non-Small Cell Lung Cancer")
+    )
+  )) %>% 
+  # Assign each sample to Group
+  left_join(data.mutations.clean %>% select(SAMPLE_ID, TP53_Mut),
+            by = c("SAMPLE_ID" = "SAMPLE_ID"))
+
+tests <- .df %>%
+  count(TP53_Mut, Group, Type) %>%
+  group_by(Type) %>%
+  group_modify({
+    ~ .x %>%
+      acast(Group ~ TP53_Mut,
+            value.var = 'n',
+            fill = 0) %>%
+      chisq.test(correct = FALSE) %>%
+      broom::tidy()
+  }) %>%
+  bind_rows() %>%
+  mutate(label = paste0("p = ", round(p.value, digits = 3)))
+
+.df %>%
+  group_by(Type, Group) %>%
+  summarize(
+    Mut = sum(TP53_Mut, na.rm = TRUE),
+    Tot = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(Freq = Mut / Tot) %>%
+  ungroup() %>%
+  ggplot() +
+  aes(x = Group, y = Freq, fill = Group, label = scales::percent(Freq, accuracy = 0.1)) +
+  geom_bar(position = 'dodge', stat = 'identity') +
+  geom_text(position = position_dodge(width = .9),
+            vjust = -0.5,
+            size = 6) +
+  geom_text(
+    data = tests,
+    mapping = aes(x = 1.5, y = -0.01, label = label),
+    vjust = 1,
+    position = position_dodge(width = .9),
+    inherit.aes = FALSE,
+    size = 6
+  ) +
+  labs(title = "Cancer Type: TP53 Mutation Frequency",
+       y = "Frequency of TP53 Mutation",
+       x = "",
+       fill = "Group") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     breaks = seq(0, 1, 0.1)) +
+  # Color matching
+  scale_fill_manual(values = c('BLACK' = '#6ad8f7', 'WHITE' = '#ff7879')) +
+  theme_gray(base_size = 18) +
+  theme(axis.text.x = element_text(
+    angle = 45,
+    vjust = 1,
+    hjust = 1
+  ),
+  legend.position = 'none') +
+  facet_wrap( ~ Type)
+
+tests
+```
+
+#### Figure 2F
+```{r}
+tmp <- data.wgd.clean %>%
+  select(SAMPLE_ID, Group, is_wgd) %>%
+  # Assign each sample to Group
+  left_join(data.mutations.clean %>% select(SAMPLE_ID, TP53_Mut),
+            by = c("SAMPLE_ID" = "SAMPLE_ID")) %>%
+  filter(TP53_Mut == 1) %>%
+  count(Group, is_wgd) %>%
+  group_by(Group) %>%
+  mutate(pct = prop.table(n))
+
+tests <- tmp  %>%
+  acast(is_wgd ~ Group, value.var = 'n') %>%
+  chisq.test(correct = FALSE) %>%
+  broom::tidy() %>%
+  mutate(label = paste0("p = ", round(p.value, digits = 3)))
+
+tmp %>%
+  filter(is_wgd == 1) %>%
+  ggplot() +
+  aes(x = Group, y = pct, fill = Group, label = scales::percent(pct, accuracy = 0.1)) +
+  geom_bar(position = 'stack', stat = 'identity') +
+  geom_text(position = position_dodge(width = .9),
+            vjust = -0.5,
+            size = 6) +
+  geom_text(
+    data = tests,
+    mapping = aes(x = 1.5, y = -0.01, label = label),
+    vjust = 1,
+    position = position_dodge(width = .9),
+    inherit.aes = FALSE,
+    size = 6
+  ) +
+  labs(title = "Pancancer: WGD Frequency in TP53-Mut by BLACK/WHITE",
+       y = "Frequency of WGD",
+       x = "",
+       fill = "Group") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     breaks = seq(0, 1, 0.1)) +
+  # Color match
+  scale_fill_manual(values = c('BLACK' = '#6ad8f7', 'WHITE' = '#ff7879')) +
+  theme_gray(base_size = 18) +
+  theme(axis.text.x = element_text(
+    angle = 45,
+    vjust = 1,
+    hjust = 1
+  ),
+  legend.position = 'none')
+
+tests
+```
+
+```{r}
+tmp <- data.wgd.clean %>%
+  select(SAMPLE_ID, Group, is_wgd) %>%
+  # Assign each sample to Group
+  left_join(data.mutations.clean %>% select(SAMPLE_ID, TP53_Mut),
+            by = c("SAMPLE_ID" = "SAMPLE_ID")) %>%
+  filter(TP53_Mut == 0) %>%
+  count(Group, is_wgd) %>%
+  group_by(Group) %>%
+  mutate(pct = prop.table(n))
+
+tests <- tmp  %>%
+  acast(is_wgd ~ Group, value.var = 'n') %>%
+  chisq.test(correct = FALSE) %>%
+  broom::tidy() %>%
+  mutate(label = paste0("p = ", round(p.value, digits = 3)))
+
+tmp %>%
+  filter(is_wgd == 1) %>%
+  ggplot() +
+  aes(x = Group, y = pct, fill = Group, label = scales::percent(pct, accuracy = 0.1)) +
+  geom_bar(position = 'stack', stat = 'identity') +
+  geom_text(position = position_dodge(width = .9),
+            vjust = -0.5,
+            size = 6) +
+  geom_text(
+    data = tests,
+    mapping = aes(x = 1.5, y = -0.01, label = label),
+    vjust = 1,
+    position = position_dodge(width = .9),
+    inherit.aes = FALSE,
+    size = 6
+  ) +
+  labs(title = "Pan-cancer: WGD Frequency in TP53-WT by BLACK/WHITE",
+       y = "Frequency of WGD",
+       x = "",
+       fill = "Group") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     breaks = seq(0, 1, 0.1)) +
+  # Color match
+  scale_fill_manual(values = c('BLACK' = '#6ad8f7', 'WHITE' = '#ff7879')) +
+  theme_gray(base_size = 18) +
+  theme(axis.text.x = element_text(
+    angle = 45,
+    vjust = 1,
+    hjust = 1
+  ),
+  legend.position = 'none')
+
+tests
+```
+
+#### Figure 2G
+```{r}
+tmp <- data.wgd.clean %>%
+  filter(
+    Cancer.Type %in% c(
+      "Breast Cancer",
+      "Endometrial Cancer",
+      "Non-Small Cell Lung Cancer"
+    ),
+    !str_detect(Cancer.Type.Detailed, "Uterine Carcinosarcoma")
+  ) %>%
+  mutate(Type = fct_collapse(
+    Cancer.Type,
+    `Breast` = c("Breast Cancer"),
+    `Endometrial` = c("Endometrial Cancer"),
+    `NSCLC` = c("Non-Small Cell Lung Cancer")
+  )) %>%
+  select(SAMPLE_ID, Group, Type, is_wgd) %>%
+  # Assign each sample to Group
+  left_join(data.mutations.clean %>% select(SAMPLE_ID, TP53_Mut),
+            by = c("SAMPLE_ID" = "SAMPLE_ID")) %>%
+  filter(TP53_Mut == 1) %>%
+  count(Group, Type, is_wgd) %>%
+  group_by(Group, Type) %>%
+  mutate(pct = prop.table(n))
+
+tests <- tmp %>%
+  group_by(Type) %>%
+  group_modify(~ {
+    .x %>%
+    acast(is_wgd ~ Group, value.var = 'n') %>%
+      chisq.test(correct = FALSE) %>%
+      broom::tidy()
+    }) %>%
+  mutate(label = paste0("p = ", round(p.value, digits = 3)))
+
+tmp %>%
+  filter(is_wgd == 1) %>%
+  ggplot() +
+  aes(x = Group, y = pct, fill = Group, label = scales::percent(pct, accuracy = 0.1)) +
+  geom_bar(position = 'stack', stat = 'identity') +
+  geom_text(position = position_dodge(width = .9),
+            vjust = -0.5,
+            size = 6) +
+  geom_text(
+    data = tests,
+    mapping = aes(x = 1.5, y = -0.01, label = label),
+    vjust = 1,
+    position = position_dodge(width = .9),
+    inherit.aes = FALSE,
+    size = 6
+  ) +
+  labs(title = "WGD Frequency in TP53-Mut by BLACK/WHITE",
+       y = "Frequency of WGD",
+       x = "",
+       fill = "Group") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     breaks = seq(0, 1, 0.1)) +
+  # Color match
+  scale_fill_manual(values = c('BLACK' = '#6ad8f7', 'WHITE' = '#ff7879')) +
+  theme_gray(base_size = 18) +
+  theme(axis.text.x = element_text(
+    angle = 45,
+    vjust = 1,
+    hjust = 1
+  ),
+  legend.position = 'none') +
+  facet_wrap(~ Type)
+
+tests
+```
+
+```{r}
+tmp <- data.wgd.clean %>%
+  filter(
+    Cancer.Type %in% c(
+      "Breast Cancer",
+      "Endometrial Cancer",
+      "Non-Small Cell Lung Cancer"
+    ),
+    !str_detect(Cancer.Type.Detailed, "Uterine Carcinosarcoma")
+  ) %>%
+  mutate(Type = fct_collapse(
+    Cancer.Type,
+    `Breast` = c("Breast Cancer"),
+    `Endometrial` = c("Endometrial Cancer"),
+    `NSCLC` = c("Non-Small Cell Lung Cancer")
+  )) %>%
+  select(SAMPLE_ID, Group, Type, is_wgd) %>%
+  # Assign each sample to Group
+  left_join(data.mutations.clean %>% select(SAMPLE_ID, TP53_Mut),
+            by = c("SAMPLE_ID" = "SAMPLE_ID")) %>%
+  filter(TP53_Mut == 0) %>%
+  count(Group, Type, is_wgd) %>%
+  group_by(Group, Type) %>%
+  mutate(pct = prop.table(n))
+
+tests <- tmp %>%
+  group_by(Type) %>%
+  group_modify(~ {
+    .x %>%
+    acast(is_wgd ~ Group, value.var = 'n') %>%
+      chisq.test(correct = FALSE) %>%
+      broom::tidy()
+    }) %>%
+  mutate(label = paste0("p = ", round(p.value, digits = 3)))
+
+tmp %>%
+  filter(is_wgd == 1) %>%
+  ggplot() +
+  aes(x = Group, y = pct, fill = Group, label = scales::percent(pct, accuracy = 0.1)) +
+  geom_bar(position = 'stack', stat = 'identity') +
+  geom_text(position = position_dodge(width = .9),
+            vjust = -0.5,
+            size = 6) +
+  geom_text(
+    data = tests,
+    mapping = aes(x = 1.5, y = -0.01, label = label),
+    vjust = 1,
+    position = position_dodge(width = .9),
+    inherit.aes = FALSE,
+    size = 6
+  ) +
+  labs(title = "WGD Frequency in TP53-WT by BLACK/WHITE",
+       y = "Frequency of WGD",
+       x = "",
+       fill = "Group") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     breaks = seq(0, 1, 0.1)) +
+  # Color match
+  scale_fill_manual(values = c('BLACK' = '#6ad8f7', 'WHITE' = '#ff7879')) +
+  theme_gray(base_size = 18) +
+  theme(axis.text.x = element_text(
+    angle = 45,
+    vjust = 1,
+    hjust = 1
+  ),
+  legend.position = 'none') +
+  facet_wrap(~ Type)
+
+tests
+```
+
+#### Figure 2H
+
+```{r}
+.mat <- raw.data.mutations %>%
+  filter(Hugo_Symbol == "TP53") %>%
+  select(Hugo_Symbol, SAMPLE_ID = Tumor_Sample_Barcode, Variant_Classification) %>%
+  # Remove symbols not in gene set
+  filter(Hugo_Symbol %in% geneset) %>%
+  # Only include mutations that affect the protein.
+  filter(!(Variant_Classification %in% ignoreMutations)) %>%
+  inner_join(data.wgd.clean %>% select(SAMPLE_ID, Group),
+             by = c("SAMPLE_ID" = "SAMPLE_ID")) %>%
+  split(f = as.factor(.$Group)) %>%
+  map(~ .x %>%
+        count(Group, Hugo_Symbol, Variant_Classification, name = 'COUNT')) %>%
+  reduce(bind_rows) %>%
+  # Remove variant types that are missing in one Group
+  add_count(Variant_Classification) %>%
+  filter(n == length(unique(Group))) %>%
+  select(-n) %>%
+  # Convert to a matrix
+  acast(Group ~ Variant_Classification, value.var = 'COUNT')
+
+.df <- raw.data.mutations %>%
+  filter(Hugo_Symbol == "TP53") %>%
+  select(Hugo_Symbol, SAMPLE_ID = Tumor_Sample_Barcode, Variant_Classification) %>%
+  # Remove symbols not in gene set
+  filter(Hugo_Symbol %in% geneset) %>%
+  # Only include mutations that affect the protein.
+  filter(
+    !(Variant_Classification %in% ignoreMutations),
+    Variant_Classification %in% colnames(.mat)
+  ) %>%
+  inner_join(data.wgd.clean %>% select(SAMPLE_ID, Group),
+             by = c("SAMPLE_ID" = "SAMPLE_ID"))
+
+.df %>%
+  tbl_cross(
+    row = 'Variant_Classification',
+    col = 'Group',
+    label = list(Variant_Classification ~ 'Variant')
+  ) %>%
+  add_p(test = 'chisq.test')
+
+.df %>%
+  count(Group, Variant_Classification) %>%
+  group_by(Group) %>%
+  mutate(pct = prop.table(n)) %>%
+  ggplot() +
+  aes(x = Group,
+      y = pct,
+      fill = fct_drop(Variant_Classification)) +
+  geom_bar(stat = 'identity', position = 'stack') +
+  labs(title = "TP53 Variants",
+       y = "Percentage",
+       x = "Group",
+       fill = "Variant") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     breaks = seq(0, 1, 0.1)) +
+  scale_fill_manual(values = c(
+    'Frame_Shift_Del' = '#9d1f18',
+    'Frame_Shift_Ins' = '#ff8f27',
+    'In_Frame_Del' = '#ffd37b',
+    'In_Frame_Ins' = '#112b88',
+    'Missense_Mutation' = '#259896',
+    'Nonsense_Mutation' = '#647fc2',
+    'Splice_Site' = '#d892c7'
+  )) +
+  theme_gray(base_size = 18) +
+  theme(axis.text.x = element_text(
+    angle = 45,
+    vjust = 1,
+    hjust = 1
+  ))
+```
+
+#### Figure 2I
+
+```{r}
+.df <- raw.data.mutations %>%
+  filter(Hugo_Symbol == "TP53") %>%
+  select(Hugo_Symbol, SAMPLE_ID = Tumor_Sample_Barcode, Variant_Classification) %>%
+  # Remove symbols not in gene set
+  filter(Hugo_Symbol %in% geneset) %>%
+  # Only include mutations that affect the protein.
+  filter(!(Variant_Classification %in% ignoreMutations)) %>%
+  inner_join(
+    data.wgd.clean %>% select(SAMPLE_ID, Group, Cancer.Type, Cancer.Type.Detailed),
+    by = c("SAMPLE_ID" = "SAMPLE_ID")
+  ) %>%
+  filter(
+    Cancer.Type %in% c(
+      "Breast Cancer",
+      "Endometrial Cancer",
+      "Non-Small Cell Lung Cancer"
+    ),
+    !str_detect(Cancer.Type.Detailed, "Uterine Carcinosarcoma")
+  ) %>%
+  mutate(Type = fct_drop(
+    fct_collapse(
+      Cancer.Type,
+      `Breast` = c("Breast Cancer"),
+      `Endometrial` = c("Endometrial Cancer"),
+      `NSCLC` = c("Non-Small Cell Lung Cancer")
+    )
+  )) %>%
+  split(f = as.factor(.$Group)) %>%
+  map(~ .x %>%
+        count(Group, Hugo_Symbol, Variant_Classification, Type, name = 'COUNT')) %>%
+  reduce(bind_rows)
+
+tests <- raw.data.mutations %>%
+  filter(Hugo_Symbol == "TP53") %>%
+  select(Hugo_Symbol, SAMPLE_ID = Tumor_Sample_Barcode, Variant_Classification) %>%
+  # Only include mutations that affect the protein.
+  filter(!(Variant_Classification %in% ignoreMutations)) %>%
+  inner_join(
+    data.wgd.clean %>% select(SAMPLE_ID, Group, Cancer.Type, Cancer.Type.Detailed),
+    by = c("SAMPLE_ID" = "SAMPLE_ID")
+  ) %>%
+  filter(
+    Cancer.Type %in% c(
+      "Breast Cancer",
+      "Endometrial Cancer",
+      "Non-Small Cell Lung Cancer"
+    ),
+    !str_detect(Cancer.Type.Detailed, "Uterine Carcinosarcoma")
+  ) %>%
+  mutate(Type = fct_drop(
+    fct_collapse(
+      Cancer.Type,
+      `Breast` = c("Breast Cancer"),
+      `Endometrial` = c("Endometrial Cancer"),
+      `NSCLC` = c("Non-Small Cell Lung Cancer")
+    )
+  )) %>%
+  select(Variant_Classification, Group, Type)  %>%
+  group_by(Type) %>%
+  group_modify(
+    ~ .x %>%
+      count(Variant_Classification, Group) %>%
+      acast(
+        Group ~ Variant_Classification,
+        value.var = 'n',
+        fill = 0
+      ) %>%
+      chisq.test(correct = FALSE) %>%
+      broom::tidy()
+  ) %>%
+  bind_rows() %>%
+  mutate(label = paste0("p = ", round(p.value, digits = 3)))
+
+.df %>%
+  group_by(Group, Type) %>%
+  mutate(pct = prop.table(COUNT)) %>%
+  ggplot() +
+  aes(x = Group,
+      y = pct,
+      fill = fct_drop(Variant_Classification)) +
+  geom_bar(stat = 'identity', position = 'stack') +
+  geom_text(
+    data = tests,
+    mapping = aes(x = 1.5, y = -0.01, label = label),
+    vjust = 1,
+    position = position_dodge(width = .9),
+    inherit.aes = FALSE,
+    size = 6
+  ) +
+  labs(title = "TP53 Variants across Cancer Subtypes",
+       y = "Percentage",
+       x = "Group",
+       fill = "Variant") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     breaks = seq(0, 1, 0.1)) +
+  scale_fill_manual(values = c(
+    'Frame_Shift_Del' = '#9d1f18',
+    'Frame_Shift_Ins' = '#ff8f27',
+    'In_Frame_Del' = '#ffd37b',
+    'In_Frame_Ins' = '#112b88',
+    'Missense_Mutation' = '#259896',
+    'Nonsense_Mutation' = '#647fc2',
+    'Splice_Site' = '#d892c7'
+  )) +
+  theme_gray(base_size = 18) +
+  theme(axis.text.x = element_text(
+    angle = 45,
+    vjust = 1,
+    hjust = 1
+  )) +
+  facet_wrap( ~ Type)
+
+tests
+```
+
+#### Figure 2J
+```{r}
+.all <-
+  subsetMaf(read.maf("data/msk_met_2021/data_mutations.txt"),
+            tsb = data.wgd.clean %>% pluck('SAMPLE_ID'))
+.white <- subsetMaf(.all,
+                    tsb = data.wgd.clean %>% filter(Group == 'WHITE') %>% pluck('SAMPLE_ID'))
+.black <- subsetMaf(.all,
+                    tsb = data.wgd.clean %>% filter(Group == 'BLACK') %>% pluck('SAMPLE_ID'))
+```
+
+```{r}
+lollipopPlot2(
+  m1 = .white,
+  m2 = .black,
+  AACol1 = 'HGVSp_Short',
+  AACol2 = 'HGVSp_Short',
+  m1_name = 'WHITE',
+  m2_name = 'BLACK',
+  gene = 'TP53',
+  refSeqID = 'NM_000546',
+  labPosSize = 2,
+  axisTextSize = c(4, 1),
+  pointSize = 2,
+  legendTxtSize = 1,
+  domainLabelSize = 2.5,
+  showDomainLabel = FALSE,
+  colors = c(
+    'Frame_Shift_Del' = '#9d1f18',
+    'Frame_Shift_Ins' = '#ff8f27',
+    'In_Frame_Del' = '#ffd37b',
+    'In_Frame_Ins' = '#112b88',
+    'Missense_Mutation' = '#259896',
+    'Nonsense_Mutation' = '#647fc2',
+    'Splice_Site' = '#d892c7'
+  )
+)
+```
+
+#### Supplemental Table: Logistic Regression Model
+```{r}
+.black <- model.reduced.black.vars %>%
+  rownames_to_column('Abberation') %>%
+  filter(!str_detect(Abberation, "Intercept")) %>%
+  mutate(Q = p.adjust(`Pr(>|z|)`, method = 'fdr')) %>%
+  mutate(
+    Gene = str_extract(Abberation, "(.+)_(.+)", group = 1),
+    Event = str_to_title(str_extract(Abberation, "(.+)_(.+)", group = 2)),
+    .before = Abberation
+  ) %>%
+  select(-Abberation) %>%
+  select(
+    Gene = Gene,
+    Event = Event,
+    Estimate = Estimate,
+    `Std. Error` = `Std. Error`,
+    `z value` = `z value`,
+    `Pr(>|z|)` = `Pr(>|z|)`,
+    `OR` = OR,
+    OR_lower = OR_lower,
+    OR_upper = OR_upper,
+    `q-value` = Q
+  )
+
+.white <- model.reduced.white.vars %>%
+  rownames_to_column('Abberation') %>%
+  filter(!str_detect(Abberation, "Intercept")) %>%
+  mutate(Q = p.adjust(`Pr(>|z|)`, method = 'fdr')) %>%
+  mutate(
+    Gene = str_extract(Abberation, "(.+)_(.+)", group = 1),
+    Event = str_to_title(str_extract(Abberation, "(.+)_(.+)", group = 2)),
+    .before = Abberation
+  ) %>%
+  select(-Abberation) %>%
+  select(
+    Gene = Gene,
+    Event = Event,
+    Estimate = Estimate,
+    `Std. Error` = `Std. Error`,
+    `z value` = `z value`,
+    `Pr(>|z|)` = `Pr(>|z|)`,
+    `OR` = OR,
+    OR_lower = OR_lower,
+    OR_upper = OR_upper,
+    `q-value` = Q
+  )
+
+.all <- model.reduced.all.vars %>%
+  rownames_to_column('Abberation') %>%
+  filter(!str_detect(Abberation, "Intercept")) %>%
+  mutate(Q = p.adjust(`Pr(>|z|)`, method = 'fdr')) %>%
+  mutate(
+    Gene = str_extract(Abberation, "(.+)_(.+)", group = 1),
+    Event = str_to_title(str_extract(Abberation, "(.+)_(.+)", group = 2)),
+    .before = Abberation
+  ) %>%
+  select(-Abberation) %>%
+  select(
+    Gene = Gene,
+    Event = Event,
+    Estimate = Estimate,
+    `Std. Error` = `Std. Error`,
+    `z value` = `z value`,
+    `Pr(>|z|)` = `Pr(>|z|)`,
+    `OR` = OR,
+    OR_lower = OR_lower,
+    OR_upper = OR_upper,
+    `q-value` = Q
+  )
+
+allTabs <- list(BLACK = .black, WHITE = .white, ALL = .all)
+write.xlsx(x = allTabs, file = "Supplemental-Logistic-Regression.xlsx", keepNA = TRUE)
+```
+
+### Figure 3
+#### Figure 3A
+```{r, warning=FALSE}
+data.clinical.patient.clean %>%
+  left_join(data.wgd.clean %>% select(SAMPLE_ID, Group),
+            by = c('SAMPLE_ID' = 'SAMPLE_ID')) %>%
+  mutate(
+    MONTHS = OS_MONTHS / dmonths(1),
+    STATUS = str_detect(OS_STATUS, 'DECEASED'),
+    GROUP = Group
+  ) %>%
+  select(MONTHS, STATUS, GROUP) %>%
+  survfit2(Surv(MONTHS, STATUS) ~ GROUP, data = .) %>%
+  ggsurvfit() +
+  add_risktable() +
+  add_pvalue(caption = "Log-rank {p.value}") +
+  labs(x = "Months",
+       y = "Overall Survival",
+       title = "Pan-cancer: Patient Race") +
+  scale_y_continuous(
+    labels = scales::percent,
+    limits = c(0, 1),
+    expand = expansion(0, 0)
+  ) +
+  scale_x_continuous(breaks = seq(0, 12 * 6, 12), limits = c(0, 12 * 6)) +
+  scale_color_manual(values = c('BLACK' = '#6ad8f7', 'WHITE' = '#ff7879'))
+```
+
+#### Figure 3B
+```{r, warning=FALSE}
+data.clinical.patient.clean %>%
+  left_join(data.wgd.clean %>% select(SAMPLE_ID, is_wgd),
+            by = c('SAMPLE_ID' = 'SAMPLE_ID')) %>%
+  mutate(
+    MONTHS = OS_MONTHS / dmonths(1),
+    STATUS = str_detect(OS_STATUS, 'DECEASED'),
+    WGD = ifelse(is_wgd == 1, 'WGD', 'No WGD')
+  ) %>%
+  select(MONTHS, STATUS, WGD) %>%
+  survfit2(Surv(MONTHS, STATUS) ~ WGD, data = .) %>%
+  ggsurvfit() +
+  add_risktable() +
+  add_pvalue(caption = "Log-rank {p.value}") +
+  labs(x = "Months",
+       y = "Overall Survival",
+       title = "Pan-cancer: WGD Status") +
+  scale_y_continuous(
+    labels = scales::percent,
+    limits = c(0, 1),
+    expand = expansion(0, 0)
+  ) +
+  scale_x_continuous(breaks = seq(0, 12 * 6, 12), limits = c(0, 12 * 6)) +
+  scale_color_manual(values = c('No WGD' = '#6ad8f7', 'WGD' = '#ff7879'))
+```
+
+#### Figure 3C
+```{r, warning=FALSE}
+data.clinical.patient.clean %>%
+  left_join(data.wgd.clean %>% select(SAMPLE_ID, Group, is_wgd),
+            by = c('SAMPLE_ID' = 'SAMPLE_ID')) %>%
+  filter(is_wgd == 1) %>%
+  mutate(
+    MONTHS = OS_MONTHS / dmonths(1),
+    STATUS = str_detect(OS_STATUS, 'DECEASED'),
+    GROUP = Group
+  ) %>%
+  select(MONTHS, STATUS, GROUP) %>%
+  survfit2(Surv(MONTHS, STATUS) ~ GROUP, data = .) %>%
+  ggsurvfit() +
+  add_risktable() +
+  add_pvalue(caption = "Log-rank {p.value}") +
+  labs(x = "Months",
+       y = "Overall Survival",
+       title = "Pan-cancer: Patient Race (WGD)") +
+  scale_y_continuous(
+    labels = scales::percent,
+    limits = c(0, 1),
+    expand = expansion(0, 0)
+  ) +
+  scale_x_continuous(breaks = seq(0, 12 * 6, 12), limits = c(0, 12 * 6)) +
+  scale_color_manual(values = c('BLACK' = '#6ad8f7', 'WHITE' = '#ff7879'))
+```
+
+#### Figure 3D
+```{r, warning=FALSE}
+data.clinical.patient.clean %>%
+  left_join(data.wgd.clean %>% select(SAMPLE_ID, Group, is_wgd),
+            by = c('SAMPLE_ID' = 'SAMPLE_ID')) %>%
+  filter(is_wgd == 0) %>%
+  mutate(
+    MONTHS = OS_MONTHS / dmonths(1),
+    STATUS = str_detect(OS_STATUS, 'DECEASED'),
+    GROUP = Group
+  ) %>%
+  select(MONTHS, STATUS, GROUP) %>%
+  survfit2(Surv(MONTHS, STATUS) ~ GROUP, data = .) %>%
+  ggsurvfit() +
+  add_risktable() +
+  add_pvalue(caption = "Log-rank {p.value}") +
+  labs(x = "Months",
+       y = "Overall Survival",
+       title = "Pan-cancer: Patient Race (No WGD)") +
+  scale_y_continuous(
+    labels = scales::percent,
+    limits = c(0, 1),
+    expand = expansion(0, 0)
+  ) +
+  scale_x_continuous(breaks = seq(0, 12 * 6, 12), limits = c(0, 12 * 6)) +
+  scale_color_manual(values = c('BLACK' = '#6ad8f7', 'WHITE' = '#ff7879'))
+```
+
+### Figure 4
+#### Figure 4A
+```{r}
+data.clinical.patient.clean %>%
+  left_join(data.wgd.clean %>% select(SAMPLE_ID, Group),
+            by = c('SAMPLE_ID' = 'SAMPLE_ID')) %>%
+  mutate(STATUS = str_detect(OS_STATUS, 'DECEASED')) %>%
+  mutate(AGE_AT_DIAGNOSIS = as.duration(
+    ifelse(
+      STATUS,
+      AGE_AT_DEATH - OS_MONTHS,
+      AGE_AT_LAST_CONTACT - OS_MONTHS
+    )
+  )) %>%
+  select(
+    Group,
+    `Age at Diagnosis` = AGE_AT_DIAGNOSIS,
+    `Age at Death` = AGE_AT_DEATH,
+    `Age at Sequencing` = AGE_AT_SEQUENCING,
+    `Age at First Metastasis` = AGE_AT_EVIDENCE_OF_METS,
+    `Age at Surgical Procedure` = AGE_AT_SURGERY
+  ) %>%
+  mutate(across(where(is.duration), ~ . / dyears(1))) %>%
+  tbl_summary(by = 'Group', missing = "no") %>%
+  add_p() %>%
+  modify_caption(caption = md("**Pan-cancer: Demographics by Patient Race**"))
+```
+
+#### Figure 4B
+```{r}
+data.clinical.patient.clean %>%
+  left_join(data.wgd.clean %>% select(SAMPLE_ID, is_wgd),
+            by = c('SAMPLE_ID' = 'SAMPLE_ID')) %>%
+  mutate(STATUS = str_detect(OS_STATUS, 'DECEASED'),
+         WGD = ifelse(is_wgd == 1, 'WGD', 'No WGD')) %>%
+  mutate(AGE_AT_DIAGNOSIS = as.duration(
+    ifelse(
+      STATUS,
+      AGE_AT_DEATH - OS_MONTHS,
+      AGE_AT_LAST_CONTACT - OS_MONTHS
+    )
+  )) %>%
+  select(
+    WGD,
+    `Age at Diagnosis` = AGE_AT_DIAGNOSIS,
+    `Age at Death` = AGE_AT_DEATH,
+    `Age at Sequencing` = AGE_AT_SEQUENCING,
+    `Age at First Metastasis` = AGE_AT_EVIDENCE_OF_METS,
+    `Age at Surgical Procedure` = AGE_AT_SURGERY
+  ) %>%
+  mutate(across(where(is.duration), ~ . / dyears(1))) %>%
+  tbl_summary(by = 'WGD', missing = "no") %>%
+  add_p() %>%
+  modify_caption(caption = md("**Pan-cancer: Demographics by WGD Status**"))
+```
+
+#### Figure 4C
+```{r}
+.df <- data.wgd.clean %>%
+  select(SAMPLE_ID, Group, MSI) %>%
+  filter(MSI %in% c("Instable", "Stable"))
+
+tests <- .df %>%
+  count(MSI, Group) %>%
+  acast(Group ~ MSI,
+        value.var = 'n',
+        fill = 0) %>%
+  chisq.test(correct = FALSE) %>%
+  broom::tidy() %>%
+  mutate(label = paste0("p = ", round(p.value, digits = 3)))
+
+.df %>%
+  group_by(Group) %>%
+  summarize(
+    Instable = sum(MSI == "Instable", na.rm = TRUE),
+    Tot = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(Freq = Instable / Tot) %>%
+  ungroup() %>%
+  ggplot() +
+  aes(
+    x = Group,
+    y = Freq,
+    fill = Group,
+    label = scales::percent(Freq, accuracy = 0.1)
+  ) +
+  geom_bar(position = 'dodge', stat = 'identity') +
+  geom_text(position = position_dodge(width = .9),
+            vjust = -0.5,
+            size = 6) +
+  geom_text(
+    data = tests,
+    mapping = aes(x = 1.5, y = -0.01, label = label),
+    vjust = 1,
+    position = position_dodge(width = .9),
+    inherit.aes = FALSE,
+    size = 6
+  ) +
+  labs(title = "Pan-cancer: MSI-H Frequency by Patient Race",
+       y = "Frequency of MSI-H",
+       x = "",
+       fill = "Group") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     breaks = seq(0, 1, 0.01)) +
+  # Color matching
+  scale_fill_manual(values = c('BLACK' = '#6ad8f7', 'WHITE' = '#ff7879')) +
+  theme_gray(base_size = 18) +
+  theme(axis.text.x = element_text(
+    angle = 45,
+    vjust = 1,
+    hjust = 1
+  ),
+  legend.position = 'none')
+
+tests
+```
+
+#### Figure 4D
+```{r}
+.df <- data.wgd.clean %>%
+  select(SAMPLE_ID, is_wgd, MSI) %>%
+  mutate(WGD = ifelse(is_wgd == 1, 'WGD', 'No WGD'))
+
+tests <- .df %>%
+  filter(MSI %in% c("Instable", "Stable")) %>%
+  count(MSI, WGD) %>%
+  acast(WGD ~ MSI,
+        value.var = 'n',
+        fill = 0) %>%
+  chisq.test(correct = FALSE) %>%
+  broom::tidy() %>%
+  mutate(label = paste0("p = ", round(p.value, digits = 3)))
+
+.df %>%
+  group_by(WGD) %>%
+  summarize(
+    Instable = sum(MSI == "Instable", na.rm = TRUE),
+    Tot = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(Freq = Instable / Tot) %>%
+  ungroup() %>%
+  ggplot() +
+  aes(
+    x = WGD,
+    y = Freq,
+    fill = WGD,
+    label = scales::percent(Freq, accuracy = 0.1)
+  ) +
+  geom_bar(position = 'dodge', stat = 'identity') +
+  geom_text(position = position_dodge(width = .9),
+            vjust = -0.5,
+            size = 6) +
+  geom_text(
+    data = tests,
+    mapping = aes(x = 1.5, y = -0.01, label = label),
+    vjust = 1,
+    position = position_dodge(width = .9),
+    inherit.aes = FALSE,
+    size = 6
+  ) +
+  labs(title = "Pan-cancer: MSI-H Frequency by WGD Status",
+       y = "Frequency of MSI-H",
+       x = "",
+       fill = "Group") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     breaks = seq(0, 1, 0.01)) +
+  # Color matching
+  scale_fill_manual(values = c('No WGD' = 'darkgreen', 'WGD' = 'green')) +
+  theme_gray(base_size = 18) +
+  theme(axis.text.x = element_text(
+    angle = 45,
+    vjust = 1,
+    hjust = 1
+  ),
+  legend.position = 'none')
+
+tests
+```
+
+#### Figure 4E
+```{r}
+pan.sex <- data.wgd.clean %>%
+  select(SAMPLE_ID, Group) %>%
+  left_join(
+    raw.data.wgd %>% select(
+      SAMPLE_ID = Sample.ID,
+      starts_with("Distant.Mets"),
+      -contains("Genital")
+    ),
+    by = c("SAMPLE_ID" = "SAMPLE_ID")
+  ) %>%
+  select(-SAMPLE_ID) %>%
+  group_by(Group) %>%
+  summarise_all(~ sum(. == 'Yes') / n()) %>%
+  pivot_longer(cols = where(is.numeric),
+               names_to = 'Location',
+               values_to = 'Percent')
+
+female.genital <- data.wgd.clean %>%
+  select(SAMPLE_ID, Group) %>%
+  left_join(
+    raw.data.wgd %>% select(SAMPLE_ID = Sample.ID, `Distant.Mets..Female.Genital`),
+    by = c("SAMPLE_ID" = "SAMPLE_ID")
+  ) %>%
+  select(-SAMPLE_ID) %>%
+  group_by(Group) %>%
+  summarise_all(~ sum(. == 'Yes') / n()) %>%
+  pivot_longer(cols = where(is.numeric),
+               names_to = 'Location',
+               values_to = 'Percent')
+
+male.genital <- data.wgd.clean %>%
+  select(SAMPLE_ID, Group) %>%
+  left_join(
+    raw.data.wgd %>% select(SAMPLE_ID = Sample.ID, `Distant.Mets..Male.Genital`),
+    by = c("SAMPLE_ID" = "SAMPLE_ID")
+  ) %>%
+  select(-SAMPLE_ID) %>%
+  group_by(Group) %>%
+  summarise_all(~ sum(. == 'Yes') / n()) %>%
+  pivot_longer(cols = where(is.numeric),
+               names_to = 'Location',
+               values_to = 'Percent')
+
+regional.LN <- data.wgd.clean %>%
+  select(SAMPLE_ID, Group) %>%
+  left_join(
+    raw.data.regional %>% select(SAMPLE_ID = contains("sample_id"), met_site_mapped),
+    by = c("SAMPLE_ID" = "SAMPLE_ID")
+  ) %>%
+  mutate(
+    `Regional LN` = str_detect(met_site_mapped, "regional_lymph"),
+    `Mapped` = met_site_mapped != ""
+  ) %>%
+  select(-SAMPLE_ID,-met_site_mapped) %>%
+  group_by(Group) %>%
+  summarise(`Regional LN` =  sum(`Regional LN`) / sum(`Mapped`)) %>%
+  pivot_longer(cols = where(is.numeric),
+               names_to = 'Location',
+               values_to = 'Percent')
+
+bind_rows(pan.sex, female.genital, male.genital, regional.LN) %>%
+  mutate(Location = str_remove(Location, "Distant.Mets") %>% str_replace_all('\\.', ' ') %>% str_squish()) %>%
+  pivot_wider(id_cols = "Location",
+              names_from = "Group",
+              values_from = "Percent") %>%
+  filter(!str_detect(Location, "Unspecified")) %>%
+  ggplot() +
+  aes(x = WHITE, y = BLACK, label = Location) +
+  geom_point() +
+  geom_label_repel() +
+  scale_y_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    breaks = seq(0, 1, 0.1),
+    limits = c(0, 0.6)
+  ) +
+  scale_x_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    breaks = seq(0, 1, 0.1),
+    limits = c(0, 0.6)
+  ) +
+  geom_abline(slope = 1,
+              intercept = 0,
+              linetype = 'dotted') +
+  labs(title = "Pan-cancer: Metastasis Location by Patient Race",
+       x = "WHITE Patients: Frequency of Metastasis",
+       y = "BLACK Patients: Frequency of Metastasis")
+```
+
+#### Figure 4F
+```{r}
+pan.sex <- data.wgd.clean %>%
+  select(SAMPLE_ID, is_wgd) %>%
+  left_join(
+    raw.data.wgd %>% select(
+      SAMPLE_ID = Sample.ID,
+      starts_with("Distant.Mets"),-contains("Genital")
+    ),
+    by = c("SAMPLE_ID" = "SAMPLE_ID")
+  ) %>%
+  mutate(WGD = ifelse(is_wgd == 1, 'WGD', 'No WGD')) %>%
+  select(-SAMPLE_ID, -is_wgd) %>%
+  group_by(WGD) %>%
+  summarise_all(~ sum(. == 'Yes') / n()) %>%
+  pivot_longer(cols = where(is.numeric),
+               names_to = 'Location',
+               values_to = 'Percent')
+
+female.genital <- data.wgd.clean %>%
+  select(SAMPLE_ID, is_wgd) %>%
+  left_join(
+    raw.data.wgd %>% select(SAMPLE_ID = Sample.ID, `Distant.Mets..Female.Genital`),
+    by = c("SAMPLE_ID" = "SAMPLE_ID")
+  ) %>%
+  mutate(WGD = ifelse(is_wgd == 1, 'WGD', 'No WGD')) %>%
+  select(-SAMPLE_ID, -is_wgd) %>%
+  group_by(WGD) %>%
+  summarise_all(~ sum(. == 'Yes') / n()) %>%
+  pivot_longer(cols = where(is.numeric),
+               names_to = 'Location',
+               values_to = 'Percent')
+
+male.genital <- data.wgd.clean %>%
+  select(SAMPLE_ID, is_wgd) %>%
+  left_join(
+    raw.data.wgd %>% select(SAMPLE_ID = Sample.ID, `Distant.Mets..Male.Genital`),
+    by = c("SAMPLE_ID" = "SAMPLE_ID")
+  ) %>%
+  mutate(WGD = ifelse(is_wgd == 1, 'WGD', 'No WGD')) %>%
+  select(-SAMPLE_ID, -is_wgd) %>%
+  group_by(WGD) %>%
+  summarise_all(~ sum(. == 'Yes') / n()) %>%
+  pivot_longer(cols = where(is.numeric),
+               names_to = 'Location',
+               values_to = 'Percent')
+
+regional.LN <- data.wgd.clean %>%
+  select(SAMPLE_ID, is_wgd) %>%
+  left_join(
+    raw.data.regional %>% select(SAMPLE_ID = contains("sample_id"), met_site_mapped),
+    by = c("SAMPLE_ID" = "SAMPLE_ID")
+  ) %>%
+  mutate(
+    `Regional LN` = str_detect(met_site_mapped, "regional_lymph"),
+    `Mapped` = met_site_mapped != "",
+    WGD = ifelse(is_wgd == 1, 'WGD', 'No WGD')
+  ) %>%
+  select(-SAMPLE_ID,-met_site_mapped,-is_wgd) %>%
+  group_by(WGD) %>%
+  summarise(`Regional LN` =  sum(`Regional LN`) / sum(`Mapped`)) %>%
+  pivot_longer(cols = where(is.numeric),
+               names_to = 'Location',
+               values_to = 'Percent')
+
+bind_rows(pan.sex, female.genital, male.genital, regional.LN) %>%
+  mutate(Location = str_remove(Location, "Distant.Mets") %>% str_replace_all('\\.', ' ') %>% str_squish()) %>%
+  pivot_wider(id_cols = "Location",
+              names_from = "WGD",
+              values_from = "Percent") %>%
+  filter(!str_detect(Location, "Unspecified")) %>%
+  ggplot() +
+  aes(x = `No WGD`, y = `WGD`, label = Location) +
+  geom_point() +
+  geom_label_repel() +
+  scale_y_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    breaks = seq(0, 1, 0.1),
+    limits = c(0, 0.6)
+  ) +
+  scale_x_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    breaks = seq(0, 1, 0.1),
+    limits = c(0, 0.6)
+  ) +
+  geom_abline(slope = 1,
+              intercept = 0,
+              linetype = 'dotted') +
+  labs(title = "Pan-cancer: Metastasis Location by Patient Race",
+       x = "No WGD Patients: Frequency of Metastasis",
+       y = "WGD Patients: Frequency of Metastasis")
+```
+
+### Figure S1
+#### Figure S1A
+```{r}
+mskmet.wgd.freq <- data.wgd.clean %>%
+  mutate(Cancer.Type = str_remove_all(Cancer.Type, "Cancer") %>% str_squish()) %>%
+  group_by(Cancer.Type) %>%
+  summarize(Percent = sum(is_wgd) / n()) %>%
+  mutate(Source = 'MSK-MET')
+
+tcga.wgd.freq <- tcga %>%
+  select(Oncotree, is_wgd) %>%
+  mutate(
+   Cancer.Type = case_when(
+     Oncotree %in% c("BLCA") ~ "Bladder",
+     Oncotree %in% c("BRCA") ~ "Breast",
+     Oncotree %in% c("CESC") ~ "Cervical Cancer",
+     Oncotree %in% c("COAD", "READ") ~ "Colorectal",
+     Oncotree %in% c("UCEC") ~ "Endometrial",
+     Oncotree %in% c("ESCA", "STAD") ~ "Esophagogastric",
+     Oncotree %in% c("TGCT") ~ "Germ Cell Tumor",
+     Oncotree %in% c("HNSC") ~ "Head and Neck",
+     Oncotree %in% c("CHOL", "LIHC") ~ "Hepatobiliary",
+     Oncotree %in% c("SKCM") ~ "Melanoma",
+     Oncotree %in% c("MESO") ~ "Mesothelioma",
+     Oncotree %in% c("LUAD", "LUSC") ~ "Non-Small Cell Lung",
+     Oncotree %in% c("OV") ~ "Ovarian",
+     Oncotree %in% c("PAAD") ~ "Pancreatic",
+     Oncotree %in% c("PRAD") ~ "Prostate",
+     Oncotree %in% c("KICH", "KIRC", "KIRP") ~ "Renal Cell Carcinoma",
+     Oncotree %in% c("SARC") ~ "Soft Tissue Sarcoma",
+     Oncotree %in% c("THCA") ~ "Thyroid"
+  )) %>%
+  group_by(Cancer.Type) %>%
+  summarize(Percent = sum(is_wgd) / n()) %>%
+  mutate(Source = 'TCGA')
+
+pcawg.wgd.freq <- pcawg %>%
+  mutate(Cancer.Type = str_remove_all(Cancer.Type, "Cancer") %>% str_squish()) %>%
+  group_by(Cancer.Type) %>%
+  summarize(Percent = sum(is_wgd) / n()) %>%
+  mutate(Source = 'PCAWG')
+
+bind_rows(mskmet.wgd.freq, tcga.wgd.freq, pcawg.wgd.freq) %>%
+  pivot_wider(id_cols = Cancer.Type,
+              names_from = Source,
+              values_from = Percent) %>%
+  filter(complete.cases(.)) %>%
+  arrange(Cancer.Type) %>%
+  filter(
+    Cancer.Type %in% c(
+      "Ovarian",
+      "Esophagogastric",
+      "Soft Tissue Sarcoma",
+      "Breast",
+      "Colorectal",
+      "Non-Small Cell Lung",
+      "Head and Neck",
+      "Hepatobiliary",
+      "Endometrial",
+      "Pancreatic",
+      "Prostate",
+      "Renal Cell Carcinoma",
+      "Thyroid"
+    )
+  ) %>%
+  rename(`Cancer Type` = Cancer.Type) %>%
+  gt() %>% 
+  tab_caption(caption = md('**Cancer Type: WGD Frequencies**')) %>%
+  tab_style(style = cell_text(weight = "bold"),
+            locations = cells_column_labels()) %>%
+  fmt_percent(columns = c(`MSK-MET`, `TCGA`, `PCAWG`), decimals = 1)
+```
+
+#### Figure S1B
+```{r}
+mskmet.wgd.freq <- data.wgd.clean %>%
+  filter(!str_detect(Cancer.Type.Detailed, "Uterine Carcinosarcoma")) %>%
+  mutate(Cancer.Type = str_remove_all(Cancer.Type, "Cancer") %>% str_squish()) %>%
+  group_by(Cancer.Type) %>%
+  summarize(Percent = sum(is_wgd) / n()) %>%
+  mutate(Source = 'MSK-MET')
+
+tcga.wgd.freq <- tcga %>%
+  select(Oncotree, is_wgd) %>%
+  mutate(
+   Cancer.Type = case_when(
+     Oncotree %in% c("BLCA") ~ "Bladder",
+     Oncotree %in% c("BRCA") ~ "Breast",
+     Oncotree %in% c("CESC") ~ "Cervical Cancer",
+     Oncotree %in% c("COAD", "READ") ~ "Colorectal",
+     Oncotree %in% c("UCEC") ~ "Endometrial",
+     Oncotree %in% c("ESCA", "STAD") ~ "Esophagogastric",
+     Oncotree %in% c("TGCT") ~ "Germ Cell Tumor",
+     Oncotree %in% c("HNSC") ~ "Head and Neck",
+     Oncotree %in% c("CHOL", "LIHC") ~ "Hepatobiliary",
+     Oncotree %in% c("SKCM") ~ "Melanoma",
+     Oncotree %in% c("MESO") ~ "Mesothelioma",
+     Oncotree %in% c("LUAD", "LUSC") ~ "Non-Small Cell Lung",
+     Oncotree %in% c("OV") ~ "Ovarian",
+     Oncotree %in% c("PAAD") ~ "Pancreatic",
+     Oncotree %in% c("PRAD") ~ "Prostate",
+     Oncotree %in% c("KICH", "KIRC", "KIRP") ~ "Renal Cell Carcinoma",
+     Oncotree %in% c("SARC") ~ "Soft Tissue Sarcoma",
+     Oncotree %in% c("THCA") ~ "Thyroid"
+  )) %>%
+  group_by(Cancer.Type) %>%
+  summarize(Percent = sum(is_wgd) / n()) %>%
+  mutate(Source = 'TCGA')
+
+bind_rows(mskmet.wgd.freq, tcga.wgd.freq) %>%
+  pivot_wider(id_cols = Cancer.Type,
+              names_from = Source,
+              values_from = Percent) %>%
+  filter(complete.cases(.)) %>%
+  filter(
+    Cancer.Type %in% c(
+      "Ovarian",
+      "Esophagogastric",
+      "Soft Tissue Sarcoma",
+      "Breast",
+      "Colorectal",
+      "Non-Small Cell Lung",
+      "Head and Neck",
+      "Hepatobiliary",
+      "Endometrial",
+      "Pancreatic",
+      "Prostate",
+      "Renal Cell Carcinoma",
+      "Thyroid"
+    )
+  ) %>%
+  ggplot() + 
+  aes(x = TCGA, y = `MSK-MET`) +
+  geom_point(size = 6) +
+  scale_y_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    breaks = seq(0, 1, 0.1),
+    limits = c(0, 0.7)
+  ) +
+  scale_x_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    breaks = seq(0, 1, 0.1),
+    limits = c(0, 0.7)
+  ) +
+  ggpmisc::stat_poly_line(se = FALSE) +
+  ggpmisc::stat_poly_eq(ggpmisc::use_label(c("R2", 'p.value')), size = 15) +
+  labs(title = "Cancer Type: WGD Frequency Correlation",
+       x = "TCGA WGD Frequency",
+       y = "MSK-MET WGD Frequency") +
+  theme(
+    text = element_text(size = 20)
+  )
+```
+
+### Figure S2
+#### Figure S2A
+```{r}
+tmp <- raw.data.wgd %>%
+  # Keep only columns/variables of interest
+  select(SAMPLE_ID = Sample.ID,
+         Sample.Type,
+         is_wgd,
+         MSI = MSI.Type,
+         Group = Race.Category,
+         Sex,
+         Cancer.Type,
+         Cancer.Type.Detailed) %>%
+  # Clean Group data
+  mutate(Group = case_when(
+    str_detect(Group, "Asian") ~ "ASIAN",
+    str_detect(Group, "White") ~ "WHITE",
+    TRUE ~ "OTHER"
+  )) %>%
+  # Clean WGD data
+  mutate(is_wgd = as.numeric(as.logical(is_wgd))) %>%
+  # Only consider decidable samples
+  filter(
+    !is.na(is_wgd),
+    Sample.Type == "Primary",
+    str_detect(Group, "WHITE|ASIAN"),
+    str_detect(Sex, "Female|Male")
+  ) %>%
+  # Enforce data types
+  mutate(across(c(
+    Sample.Type, Group, Sex, Cancer.Type
+  ), factor)) %>%
+  # Assertions of assumptions
+  assert(is_uniq, SAMPLE_ID) %>%
+  assert(in_set(0, 1), is_wgd) %>%
+  assert(in_set("Female", "Male"), Sex) %>%
+  assert(in_set("WHITE", "ASIAN"), Group) %>%
+  verify(Sample.Type == "Primary") %>%
+  assert(not_na, Cancer.Type, is_wgd, Sex, Sample.Type, SAMPLE_ID) %>%
+  count(Group, is_wgd) %>%
+  group_by(Group) %>%
+  mutate(Percent = n / sum(n))  %>%
+  ungroup() %>%
+  mutate(Source = "MSK-MET")
+
+tests <- tmp %>%
+  group_by(Source) %>%
+  group_modify( ~ {
+    .x %>%
+      acast(is_wgd ~ Group, value.var = 'n', fill = 0) %>%
+      chisq.test(correct = FALSE) %>%
+      broom::tidy()
+  }) %>%
+  mutate(label = paste0("p = ", round(p.value, digits = 3)))
+
+tmp %>%
+  filter(is_wgd == 1) %>%
+  ggplot() +
+  aes(
+    x = Source,
+    y = Percent,
+    fill = Group,
+    label = scales::percent(Percent, accuracy = 0.1)
+  ) +
+  geom_bar(stat = 'identity', position = 'dodge') +
+  geom_text(position = position_dodge(width = .9),
+            vjust = -0.5,
+            size = 6) +
+  geom_text(
+    data = tests,
+    mapping = aes(x = Source, y = -0.005, label = label),
+    vjust = 1,
+    position = position_dodge(width = .9),
+    inherit.aes = FALSE,
+    size = 6
+  ) +
+  labs(y = 'Frequency of WGD',
+       title = 'Pan-cancer: WGD Frequency by Race') +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     breaks = seq(0, 1, 0.1)) +
+  # Color matching
+  scale_fill_manual(values = c('ASIAN' = '#4511bb', 'WHITE' = '#ff7879')) +
+  theme_gray(base_size = 16) +
+  theme(axis.title.x = element_blank())
+
+tests
+```
+
+```{r}
+tmp <- read_csv(
+    "data/tcga/TCGA_Demographics.csv",
+    col_select = c(
+      PATIENT_ID = bcr_patient_barcode,
+      Group = race,
+      Oncotree = type,
+      Sex = gender,
+      Hist = histological_type
+    )
+  ) %>%
+  inner_join(
+    read_csv(
+      "data/tcga/TCGA_arm_scores.csv",
+      col_select = c(SAMPLE_ID = Sample, Genome_doublings)
+    ) %>%
+      # Only consider Primary tumors
+      filter(str_detect(SAMPLE_ID, "^.*-01$")) %>%
+      # Extract the patient ID
+      mutate(PATIENT_ID = str_extract(SAMPLE_ID, "\\w{4}-\\w{2}-\\w{4}")),
+    by = c("PATIENT_ID")
+  ) %>%
+  mutate(is_wgd = Genome_doublings > 0) %>%
+  mutate(Sex = str_to_title(Sex)) %>%
+  mutate(Group = case_when(
+    str_detect(Group, "ASIAN") ~ "ASIAN",
+    str_detect(Group, "WHITE") ~ "WHITE",
+    TRUE ~ "OTHER"
+  )) %>%
+  # Only consider decidable samples
+  filter(
+    !is.na(is_wgd),
+    str_detect(SAMPLE_ID, "^.*-01$"),
+    str_detect(Group, "WHITE|ASIAN"),
+    str_detect(Sex, "Female|Male")
+  ) %>%
+  # Assertions of assumptions
+  assert(is_uniq, SAMPLE_ID, PATIENT_ID) %>%
+  assert(in_set(0, 1), is_wgd) %>%
+  assert(in_set("Female", "Male"), Sex) %>%
+  assert(in_set("WHITE", "ASIAN"), Group) %>%
+  verify(str_detect(SAMPLE_ID, "^.*-01$")) %>%
+  assert(not_na, Oncotree, is_wgd, Sex, PATIENT_ID, SAMPLE_ID) %>%
+  count(Group, is_wgd) %>%
+  group_by(Group) %>%
+  mutate(Percent = n / sum(n))  %>%
+  ungroup() %>%
+  mutate(Source = "TCGA")
+
+tests <- tmp %>%
+  group_by(Source) %>%
+  group_modify( ~ {
+    .x %>%
+      acast(is_wgd ~ Group, value.var = 'n', fill = 0) %>%
+      chisq.test(correct = FALSE) %>%
+      broom::tidy()
+  }) %>%
+  mutate(label = paste0("p = ", round(p.value, digits = 3)))
+
+tmp %>%
+  filter(is_wgd == 1) %>%
+  ggplot() +
+  aes(
+    x = Source,
+    y = Percent,
+    fill = Group,
+    label = scales::percent(Percent, accuracy = 0.1)
+  ) +
+  geom_bar(stat = 'identity', position = 'dodge') +
+  geom_text(position = position_dodge(width = .9),
+            vjust = -0.5,
+            size = 6) +
+  geom_text(
+    data = tests,
+    mapping = aes(x = Source, y = -0.005, label = label),
+    vjust = 1,
+    position = position_dodge(width = .9),
+    inherit.aes = FALSE,
+    size = 6
+  ) +
+  labs(y = 'Frequency of WGD',
+       title = 'Pan-cancer: WGD Frequency by Race') +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     breaks = seq(0, 1, 0.1)) +
+  # Color matching
+  scale_fill_manual(values = c('ASIAN' = '#4511bb', 'WHITE' = '#ff7879')) +
+  theme_gray(base_size = 16) +
+  theme(axis.title.x = element_blank())
+
+tests
+```
+
+#### Figure S2B
+```{r}
+tmp <- data.wgd.clean %>%
+  count(Sex, is_wgd) %>%
+  group_by(Sex) %>%
+  mutate(Percent = n / sum(n)) %>%
+  ungroup() %>%
+  mutate(Source = 'MSK-MET')
+
+tests <- tmp %>%
+  group_by(Source) %>%
+  group_modify( ~ {
+    .x %>%
+      acast(is_wgd ~ Sex, value.var = 'n', fill = 0) %>%
+      chisq.test(correct = FALSE) %>%
+      broom::tidy()
+  }) %>%
+  mutate(label = paste0("p = ", round(p.value, digits = 3)))
+
+tmp %>%
+  filter(is_wgd == 1) %>%
+  ggplot() +
+  aes(
+    x = Sex,
+    y = Percent,
+    label = scales::percent(Percent, accuracy = 0.1)
+  ) +
+  geom_bar(stat = 'identity', position = 'dodge', fill = 'darkred') +
+  geom_text(position = position_dodge(width = .9),
+            vjust = -0.5,
+            size = 6) +
+  labs(y = 'Frequency of WGD',
+       title = 'Pan-cancer: WGD Frequency by Sex') +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     breaks = seq(0, 1, 0.1)) +
+  # Color matching
+  theme_gray(base_size = 16) +
+  theme(axis.title.x = element_blank())
+
+tests
+```
+
+```{r}
+tmp <- tcga %>%
+  count(Sex, is_wgd) %>%
+  group_by(Sex) %>%
+  mutate(Percent = n / sum(n)) %>%
+  ungroup() %>%
+  mutate(Source = 'TCGA')
+
+tests <- tmp %>%
+  group_by(Source) %>%
+  group_modify(~ {
+    .x %>%
+      acast(is_wgd ~ Sex, value.var = 'n', fill = 0) %>%
+      chisq.test(correct = FALSE) %>%
+      broom::tidy()
+  }) %>%
+  mutate(label = paste0("p = ", round(p.value, digits = 3)))
+
+tmp %>%
+  filter(is_wgd == 1) %>%
+  ggplot() +
+  aes(
+    x = Sex,
+    y = Percent,
+    label = scales::percent(Percent, accuracy = 0.1)
+  ) +
+  geom_bar(stat = 'identity',
+           position = 'dodge',
+           fill = 'orange') +
+  geom_text(position = position_dodge(width = .9),
+            vjust = -0.5,
+            size = 6) +
+  labs(y = 'Frequency of WGD',
+       title = 'Pan-cancer: WGD Frequency by Sex') +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     breaks = seq(0, 1, 0.1)) +
+  # Color matching
+  theme_gray(base_size = 16) +
+  theme(axis.title.x = element_blank())
+
+tests
+```
+
+### Figure S3
+#### Figure S3A
+```{r}
+tmp <- raw.data.wgd %>%
+  # Keep only columns/variables of interest
+  select(SAMPLE_ID = Sample.ID,
+         Metastatic.patient,
+         is_wgd,
+         Group = Race.Category,
+         Sample.Type,
+         Sex,
+         Cancer.Type,
+         Cancer.Type.Detailed) %>%
+  # Clean Group data
+  mutate(Group = case_when(
+    str_detect(Group, "Black") ~ "BLACK",
+    str_detect(Group, "White") ~ "WHITE",
+    TRUE ~ "OTHER"
+  )) %>%
+  # Clean WGD data
+  mutate(is_wgd = as.numeric(as.logical(is_wgd))) %>%
+  # Only consider decidable samples
+  filter(
+    !is.na(is_wgd),
+    Sample.Type == "Primary",
+    str_detect(Group, "WHITE|BLACK"),
+    str_detect(Sex, "Female|Male")
+  ) %>%
+  # Enforce data types
+  mutate(across(c(Group, Sex, Cancer.Type), factor)) %>% 
+  # Assertions of assumptions
+  assert(is_uniq, SAMPLE_ID) %>%
+  assert(in_set(0, 1), is_wgd) %>%
+  assert(in_set("Female", "Male"), Sex) %>%
+  assert(in_set("WHITE", "BLACK"), Group) %>%
+  assert(not_na, Cancer.Type, is_wgd, Sex, SAMPLE_ID) %>%
+  filter(Cancer.Type == "Breast Cancer") %>%
+  count(Group, is_wgd, Metastatic.patient) %>%
+  group_by(Metastatic.patient, Group) %>%
+  mutate(Percent = n / sum(n)) %>%
+  ungroup() %>%
+  mutate(Type = ifelse(Metastatic.patient, 'Metastatic Patients', 'Nonmetastatic Patients'))
+
+tests <- tmp %>%
+  group_by(Type) %>%
+  group_modify(~ {
+    .x %>%
+      acast(is_wgd ~ Group, value.var = 'n', fill = 0) %>%
+      fisher.test() %>%
+      broom::tidy()
+  }) %>%
+  mutate(label = paste0("p = ", round(p.value, digits = 3)))
+
+tmp %>%
+  filter(is_wgd == 1) %>%
+  ggplot() +
+  aes(
+    x = Type,
+    y = Percent,
+    fill = Group,
+    label = scales::percent(Percent, accuracy = 0.1)
+  ) +
+  geom_bar(stat = 'identity', position = 'dodge') +
+  geom_text(position = position_dodge(width = .9),
+            vjust = -0.5,
+            size = 6) +
+  geom_text(
+    data = tests,
+    mapping = aes(x = Type, y = -0.005, label = label),
+    vjust = 1,
+    position = position_dodge(width = .9),
+    inherit.aes = FALSE,
+    size = 6
+  ) +
+  labs(y = 'Frequency of WGD',
+       title = 'MSK-MET BREAST: Patient Status by Race') +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     breaks = seq(0, 1, 0.1)) +
+  # Color matching
+  scale_fill_manual(values = c('BLACK' = '#6ad8f7', 'WHITE' = '#ff7879')) +
+  theme_gray(base_size = 16) +
+  theme(axis.title.x = element_blank())
+
+tests
+```
+
+#### Figure S3B
+```{r}
+tmp <- read_csv(
+    "data/tcga/TCGA_Demographics.csv",
+    col_select = c(
+      PATIENT_ID = bcr_patient_barcode,
+      Group = race,
+      Oncotree = type,
+      Sex = gender,
+      Hist = histological_type,
+      Staging = ajcc_pathologic_tumor_stage
+    )
+  ) %>%
+  inner_join(
+    read_csv(
+      "data/tcga/TCGA_arm_scores.csv",
+      col_select = c(SAMPLE_ID = Sample, Genome_doublings)
+    ) %>%
+      # Only consider Primary tumors
+      filter(str_detect(SAMPLE_ID, "^.*-01$")) %>%
+      # Extract the patient ID
+      mutate(PATIENT_ID = str_extract(SAMPLE_ID, "\\w{4}-\\w{2}-\\w{4}")),
+    by = c("PATIENT_ID")
+  ) %>%
+  mutate(is_wgd = Genome_doublings > 0) %>%
+  mutate(Sex = str_to_title(Sex)) %>%
+  mutate(Group = case_when(
+    str_detect(Group, "BLACK") ~ "BLACK",
+    str_detect(Group, "WHITE") ~ "WHITE",
+    TRUE ~ "OTHER"
+  )) %>%
+  # Only consider decidable samples
+  filter(
+    !is.na(is_wgd),
+    str_detect(SAMPLE_ID, "^.*-01$"),
+    str_detect(Group, "WHITE|BLACK"),
+    str_detect(Sex, "Female|Male")
+  ) %>%
+  # Assertions of assumptions
+  assert(is_uniq, SAMPLE_ID, PATIENT_ID) %>%
+  assert(in_set(0, 1), is_wgd) %>%
+  assert(in_set("Female", "Male"), Sex) %>%
+  assert(in_set("WHITE", "BLACK"), Group) %>%
+  verify(str_detect(SAMPLE_ID, "^.*-01$")) %>%
+  assert(not_na, Oncotree, is_wgd, Sex, PATIENT_ID, SAMPLE_ID) %>%
+  filter(Oncotree == "BRCA") %>%
+  mutate(Stage = case_when(
+    Staging %in% c("Stage I", "Stage IA", "Stage IB") ~ "Stage I",
+    Staging %in% c("Stage II", "Stage IIA", "Stage IIB") ~ "Stage II",
+    Staging %in% c("Stage III", "Stage IIIA", "Stage IIIB", "Stage IIIC") ~ "Stage III",
+    Staging %in% c("Stage IV") ~ "Stage IV",
+    TRUE ~ "Unknown"
+  )) %>%
+  count(Group, is_wgd, Stage) %>%
+  group_by(Stage, Group) %>%
+  mutate(Percent = n / sum(n)) %>%
+  ungroup()
+
+tests <- tmp %>%
+  group_by(Stage) %>%
+  group_modify(~ {
+    .x %>%
+      acast(is_wgd ~ Group, value.var = 'n', fill = 0) %>%
+      fisher.test() %>%
+      broom::tidy()
+  }) %>%
+  mutate(label = paste0("p = ", round(p.value, digits = 3)))
+
+tmp %>%
+  filter(is_wgd == 1) %>%
+  ggplot() +
+  aes(
+    x = Stage,
+    y = Percent,
+    fill = Group,
+    label = scales::percent(Percent, accuracy = 0.1)
+  ) +
+  geom_bar(stat = 'identity', position = 'dodge') +
+  geom_text(position = position_dodge(width = .9),
+            vjust = -0.5,
+            size = 6) +
+  geom_text(
+    data = tests,
+    mapping = aes(x = Stage, y = -0.005, label = label),
+    vjust = 1,
+    position = position_dodge(width = .9),
+    inherit.aes = FALSE,
+    size = 6
+  ) +
+  labs(y = 'Frequency of WGD',
+       title = 'TCGA BREAST: Staging by Race') +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     breaks = seq(0, 1, 0.1)) +
+  # Color matching
+  scale_fill_manual(values = c('BLACK' = '#6ad8f7', 'WHITE' = '#ff7879')) +
+  theme_gray(base_size = 16) +
+  theme(axis.title.x = element_blank())
+
+tests
+```
+
+#### Figure S3C
+```{r}
+tmp <- raw.data.wgd %>%
+  # Keep only columns/variables of interest
+  select(SAMPLE_ID = Sample.ID,
+         Metastatic.patient,
+         is_wgd,
+         Group = Race.Category,
+         Sample.Type,
+         Sex,
+         Cancer.Type,
+         Cancer.Type.Detailed) %>%
+  # Clean Group data
+  mutate(Group = case_when(
+    str_detect(Group, "Black") ~ "BLACK",
+    str_detect(Group, "White") ~ "WHITE",
+    TRUE ~ "OTHER"
+  )) %>%
+  # Clean WGD data
+  mutate(is_wgd = as.numeric(as.logical(is_wgd))) %>%
+  # Only consider decidable samples
+  filter(
+    !is.na(is_wgd),
+    Sample.Type == "Primary",
+    str_detect(Group, "WHITE|BLACK"),
+    str_detect(Sex, "Female|Male")
+  ) %>%
+  # Enforce data types
+  mutate(across(c(Group, Sex, Cancer.Type), factor)) %>% 
+  # Assertions of assumptions
+  assert(is_uniq, SAMPLE_ID) %>%
+  assert(in_set(0, 1), is_wgd) %>%
+  assert(in_set("Female", "Male"), Sex) %>%
+  assert(in_set("WHITE", "BLACK"), Group) %>%
+  assert(not_na, Cancer.Type, Sex, SAMPLE_ID) %>%
+  filter(Cancer.Type == "Breast Cancer") %>%
+  count(Group, Metastatic.patient) %>%
+  group_by(Group) %>%
+  mutate(Percent = n / sum(n)) %>%
+  ungroup() %>%
+  mutate(Type = ifelse(Metastatic.patient, 'Metastatic Patients', 'Nonmetastatic Patients'))
+
+tests <- tmp %>%
+  acast(Group ~ Type, value.var = 'n', fill = 0) %>%
+  chisq.test(correct = FALSE)
+
+tmp %>%
+  ggplot() +
+  aes(x = Group,
+      y = Percent,
+      fill = Type) +
+  geom_bar(stat = 'identity', position = 'stack') +
+  labs(y = '',
+       title = 'MSK-MET BREAST: Stage Distribution') +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     breaks = seq(0, 1, 0.1)) +
+  # Color matching
+  scale_fill_manual(values = c('Metastatic Patients' = '#ff0033', 'Nonmetastatic Patients' = '#0078ff')) +
+  theme_gray(base_size = 16) +
+  theme(axis.title.x = element_blank())
+
+tests
+```
+
+#### Figure S3D
+```{r}
+tmp <- read_csv(
+    "data/tcga/TCGA_Demographics.csv",
+    col_select = c(
+      PATIENT_ID = bcr_patient_barcode,
+      Group = race,
+      Oncotree = type,
+      Sex = gender,
+      Hist = histological_type,
+      Staging = ajcc_pathologic_tumor_stage
+    )
+  ) %>%
+  inner_join(
+    read_csv(
+      "data/tcga/TCGA_arm_scores.csv",
+      col_select = c(SAMPLE_ID = Sample, Genome_doublings)
+    ) %>%
+      # Only consider Primary tumors
+      filter(str_detect(SAMPLE_ID, "^.*-01$")) %>%
+      # Extract the patient ID
+      mutate(PATIENT_ID = str_extract(SAMPLE_ID, "\\w{4}-\\w{2}-\\w{4}")),
+    by = c("PATIENT_ID")
+  ) %>%
+  mutate(is_wgd = Genome_doublings > 0) %>%
+  mutate(Sex = str_to_title(Sex)) %>%
+  mutate(Group = case_when(
+    str_detect(Group, "BLACK") ~ "BLACK",
+    str_detect(Group, "WHITE") ~ "WHITE",
+    TRUE ~ "OTHER"
+  )) %>%
+  # Only consider decidable samples
+  filter(
+    !is.na(is_wgd),
+    str_detect(SAMPLE_ID, "^.*-01$"),
+    str_detect(Group, "WHITE|BLACK"),
+    str_detect(Sex, "Female|Male")
+  ) %>%
+  # Assertions of assumptions
+  assert(is_uniq, SAMPLE_ID, PATIENT_ID) %>%
+  assert(in_set(0, 1), is_wgd) %>%
+  assert(in_set("Female", "Male"), Sex) %>%
+  assert(in_set("WHITE", "BLACK"), Group) %>%
+  verify(str_detect(SAMPLE_ID, "^.*-01$")) %>%
+  assert(not_na, Oncotree, is_wgd, Sex, PATIENT_ID, SAMPLE_ID) %>%
+  filter(Oncotree == "BRCA") %>%
+  mutate(Stage = case_when(
+    Staging %in% c("Stage I", "Stage IA", "Stage IB") ~ "Stage I",
+    Staging %in% c("Stage II", "Stage IIA", "Stage IIB") ~ "Stage II",
+    Staging %in% c("Stage III", "Stage IIIA", "Stage IIIB", "Stage IIIC") ~ "Stage III",
+    Staging %in% c("Stage IV") ~ "Stage IV",
+    TRUE ~ "Unknown"
+  )) %>%
+  count(Group, Stage) %>%
+  group_by(Group) %>%
+  mutate(Percent = n / sum(n)) %>%
+  ungroup()
+
+tests <- tmp %>%
+  acast(Group ~ Stage, value.var = 'n', fill = 0) %>%
+  chisq.test(correct = FALSE)
+
+tmp %>%
+  ggplot() +
+  aes(x = Group,
+      y = Percent,
+      fill = Stage) +
+  geom_bar(stat = 'identity', position = 'stack') +
+  labs(y = '',
+       title = 'TCGA BREAST: Stage Distribution') +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     breaks = seq(0, 1, 0.1)) +
+  # Color matching
+  scale_fill_brewer(palette = "Accent") +
+  theme_gray(base_size = 16) +
+  theme(axis.title.x = element_blank())
+
+tests
+```
+
+#### Figure S3E
+```{r}
+tmp <- raw.data.wgd %>%
+  # Keep only columns/variables of interest
+  select(SAMPLE_ID = Sample.ID,
+         Metastatic.patient,
+         is_wgd,
+         Group = Race.Category,
+         Sample.Type,
+         Sex,
+         Cancer.Type,
+         Cancer.Type.Detailed) %>%
+  # Clean Group data
+  mutate(Group = case_when(
+    str_detect(Group, "Black") ~ "BLACK",
+    str_detect(Group, "White") ~ "WHITE",
+    TRUE ~ "OTHER"
+  )) %>%
+  # Clean WGD data
+  mutate(is_wgd = as.numeric(as.logical(is_wgd))) %>%
+  # Only consider decidable samples
+  filter(
+    !is.na(is_wgd),
+    Sample.Type == "Primary",
+    str_detect(Group, "WHITE|BLACK"),
+    str_detect(Sex, "Female|Male")
+  ) %>%
+  # Enforce data types
+  mutate(across(c(Group, Sex, Cancer.Type), factor)) %>% 
+  # Assertions of assumptions
+  assert(is_uniq, SAMPLE_ID) %>%
+  assert(in_set(0, 1), is_wgd) %>%
+  assert(in_set("Female", "Male"), Sex) %>%
+  assert(in_set("WHITE", "BLACK"), Group) %>%
+  assert(not_na, Cancer.Type, is_wgd, Sex, SAMPLE_ID) %>%
+  filter(
+    Cancer.Type == "Endometrial Cancer",
+    !str_detect(Cancer.Type.Detailed, "Uterine Carcinosarcoma")
+  ) %>% 
+  count(Group, is_wgd, Metastatic.patient) %>%
+  group_by(Metastatic.patient, Group) %>%
+  mutate(Percent = n / sum(n)) %>%
+  ungroup() %>% 
+  mutate(Type = ifelse(Metastatic.patient, 'Metastatic Patients', 'Nonmetastatic Patients'))
+
+tests <- tmp %>%
+  group_by(Type) %>%
+  group_modify(~ {
+    .x %>%
+      acast(is_wgd ~ Group, value.var = 'n', fill = 0) %>%
+      fisher.test() %>%
+      broom::tidy()
+  }) %>%
+  mutate(label = paste0("p = ", round(p.value, digits = 3)))
+
+tmp %>%
+  filter(is_wgd == 1) %>%
+  ggplot() +
+  aes(
+    x = Type,
+    y = Percent,
+    fill = Group,
+    label = scales::percent(Percent, accuracy = 0.1)
+  ) +
+  geom_bar(stat = 'identity', position = 'dodge') +
+  geom_text(position = position_dodge(width = .9),
+            vjust = -0.5,
+            size = 6) +
+  geom_text(
+    data = tests,
+    mapping = aes(x = Type, y = -0.005, label = label),
+    vjust = 1,
+    position = position_dodge(width = .9),
+    inherit.aes = FALSE,
+    size = 6
+  ) +
+  labs(y = 'Frequency of WGD',
+       title = 'MSK-MET ENDOMETRIAL: Patient Status by Race') +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     breaks = seq(0, 1, 0.1)) +
+  # Color matching
+  scale_fill_manual(values = c('BLACK' = '#6ad8f7', 'WHITE' = '#ff7879')) +
+  theme_gray(base_size = 16) +
+  theme(axis.title.x = element_blank())
+
+tests
+```
+
+#### Figure S3F
+```{r}
+tmp <- read_csv(
+    "data/tcga/TCGA_Demographics.csv",
+    col_select = c(
+      PATIENT_ID = bcr_patient_barcode,
+      Group = race,
+      Oncotree = type,
+      Sex = gender,
+      Hist = histological_type,
+      Staging = clinical_stage
+    )
+  ) %>%
+  inner_join(
+    read_csv(
+      "data/tcga/TCGA_arm_scores.csv",
+      col_select = c(SAMPLE_ID = Sample, Genome_doublings)
+    ) %>%
+      # Only consider Primary tumors
+      filter(str_detect(SAMPLE_ID, "^.*-01$")) %>%
+      # Extract the patient ID
+      mutate(PATIENT_ID = str_extract(SAMPLE_ID, "\\w{4}-\\w{2}-\\w{4}")),
+    by = c("PATIENT_ID")
+  ) %>%
+  mutate(is_wgd = Genome_doublings > 0) %>%
+  mutate(Sex = str_to_title(Sex)) %>%
+  mutate(Group = case_when(
+    str_detect(Group, "BLACK") ~ "BLACK",
+    str_detect(Group, "WHITE") ~ "WHITE",
+    TRUE ~ "OTHER"
+  )) %>%
+  # Only consider decidable samples
+  filter(
+    !is.na(is_wgd),
+    str_detect(SAMPLE_ID, "^.*-01$"),
+    str_detect(Group, "WHITE|BLACK"),
+    str_detect(Sex, "Female|Male")
+  ) %>%
+  # Assertions of assumptions
+  assert(is_uniq, SAMPLE_ID, PATIENT_ID) %>%
+  assert(in_set(0, 1), is_wgd) %>%
+  assert(in_set("Female", "Male"), Sex) %>%
+  assert(in_set("WHITE", "BLACK"), Group) %>%
+  verify(str_detect(SAMPLE_ID, "^.*-01$")) %>%
+  assert(not_na, Oncotree, is_wgd, Sex, PATIENT_ID, SAMPLE_ID) %>%
+  filter(Oncotree %in% c("UCEC")) %>%
+  mutate(Stage = case_when(
+    Staging %in% c("Stage I", "Stage IA", "Stage IB", "Stage IC") ~ "Stage I",
+    Staging %in% c("Stage II", "Stage IIA", "Stage IIB") ~ "Stage II",
+    Staging %in% c("Stage III", "Stage IIIA", "Stage IIIB", "Stage IIIC", "Stage IIIC1", "Stage IIIC2") ~ "Stage III",
+    Staging %in% c("Stage IV", "Stage IVA", "Stage IVB") ~ "Stage IV",
+    TRUE ~ "Unknown"
+  )) %>%
+  count(Group, is_wgd, Stage) %>%
+  group_by(Stage, Group) %>%
+  mutate(Percent = n / sum(n)) %>%
+  ungroup()
+
+tests <- tmp %>%
+  group_by(Stage) %>%
+  group_modify(~ {
+    .x %>%
+      acast(is_wgd ~ Group, value.var = 'n', fill = 0) %>%
+      fisher.test() %>%
+      broom::tidy()
+  }) %>%
+  mutate(label = paste0("p = ", round(p.value, digits = 3)))
+
+tmp %>%
+  filter(is_wgd == 1) %>%
+  ggplot() +
+  aes(
+    x = Stage,
+    y = Percent,
+    fill = Group,
+    label = scales::percent(Percent, accuracy = 0.1)
+  ) +
+  geom_bar(stat = 'identity', position = 'dodge') +
+  geom_text(position = position_dodge(width = .9),
+            vjust = -0.5,
+            size = 6) +
+  geom_text(
+    data = tests,
+    mapping = aes(x = Stage, y = -0.005, label = label),
+    vjust = 1,
+    position = position_dodge(width = .9),
+    inherit.aes = FALSE,
+    size = 6
+  ) +
+  labs(y = 'Frequency of WGD',
+       title = 'TCGA ENDOMETRIAL: Staging by Race') +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     breaks = seq(0, 1, 0.1)) +
+  # Color matching
+  scale_fill_manual(values = c('BLACK' = '#6ad8f7', 'WHITE' = '#ff7879')) +
+  theme_gray(base_size = 16) +
+  theme(axis.title.x = element_blank())
+
+tests
+```
+
+#### Figure S3G
+```{r}
+tmp <- raw.data.wgd %>%
+  # Keep only columns/variables of interest
+  select(SAMPLE_ID = Sample.ID,
+         Metastatic.patient,
+         is_wgd,
+         Group = Race.Category,
+         Sample.Type,
+         Sex,
+         Cancer.Type,
+         Cancer.Type.Detailed) %>%
+  # Clean Group data
+  mutate(Group = case_when(
+    str_detect(Group, "Black") ~ "BLACK",
+    str_detect(Group, "White") ~ "WHITE",
+    TRUE ~ "OTHER"
+  )) %>%
+  # Clean WGD data
+  mutate(is_wgd = as.numeric(as.logical(is_wgd))) %>%
+  # Only consider decidable samples
+  filter(
+    !is.na(is_wgd),
+    Sample.Type == "Primary",
+    str_detect(Group, "WHITE|BLACK"),
+    str_detect(Sex, "Female|Male")
+  ) %>%
+  # Enforce data types
+  mutate(across(c(Group, Sex, Cancer.Type), factor)) %>% 
+  # Assertions of assumptions
+  assert(is_uniq, SAMPLE_ID) %>%
+  assert(in_set(0, 1), is_wgd) %>%
+  assert(in_set("Female", "Male"), Sex) %>%
+  assert(in_set("WHITE", "BLACK"), Group) %>%
+  assert(not_na, Cancer.Type, Sex, SAMPLE_ID) %>%
+  filter(Cancer.Type == "Endometrial Cancer") %>%
+  count(Group, Metastatic.patient) %>%
+  group_by(Group) %>%
+  mutate(Percent = n / sum(n)) %>%
+  ungroup() %>%
+  mutate(Type = ifelse(Metastatic.patient, 'Metastatic Patients', 'Nonmetastatic Patients'))
+
+tests <- tmp %>%
+  acast(Group ~ Type, value.var = 'n', fill = 0) %>%
+  chisq.test(correct = FALSE)
+
+tmp %>%
+  ggplot() +
+  aes(x = Group,
+      y = Percent,
+      fill = Type) +
+  geom_bar(stat = 'identity', position = 'stack') +
+  labs(y = '',
+       title = 'MSK-MET ENDOMETRIAL: Stage Distribution') +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     breaks = seq(0, 1, 0.1)) +
+  # Color matching
+  scale_fill_manual(values = c('Metastatic Patients' = '#ff0033', 'Nonmetastatic Patients' = '#0078ff')) +
+  theme_gray(base_size = 16) +
+  theme(axis.title.x = element_blank())
+
+tests
+```
+
+#### Figure S3H
+```{r}
+tmp <- read_csv(
+    "data/tcga/TCGA_Demographics.csv",
+    col_select = c(
+      PATIENT_ID = bcr_patient_barcode,
+      Group = race,
+      Oncotree = type,
+      Sex = gender,
+      Hist = histological_type,
+      Staging = clinical_stage
+    )
+  ) %>%
+  inner_join(
+    read_csv(
+      "data/tcga/TCGA_arm_scores.csv",
+      col_select = c(SAMPLE_ID = Sample, Genome_doublings)
+    ) %>%
+      # Only consider Primary tumors
+      filter(str_detect(SAMPLE_ID, "^.*-01$")) %>%
+      # Extract the patient ID
+      mutate(PATIENT_ID = str_extract(SAMPLE_ID, "\\w{4}-\\w{2}-\\w{4}")),
+    by = c("PATIENT_ID")
+  ) %>%
+  mutate(is_wgd = Genome_doublings > 0) %>%
+  mutate(Sex = str_to_title(Sex)) %>%
+  mutate(Group = case_when(
+    str_detect(Group, "BLACK") ~ "BLACK",
+    str_detect(Group, "WHITE") ~ "WHITE",
+    TRUE ~ "OTHER"
+  )) %>%
+  # Only consider decidable samples
+  filter(
+    !is.na(is_wgd),
+    str_detect(SAMPLE_ID, "^.*-01$"),
+    str_detect(Group, "WHITE|BLACK"),
+    str_detect(Sex, "Female|Male")
+  ) %>%
+  # Assertions of assumptions
+  assert(is_uniq, SAMPLE_ID, PATIENT_ID) %>%
+  assert(in_set(0, 1), is_wgd) %>%
+  assert(in_set("Female", "Male"), Sex) %>%
+  assert(in_set("WHITE", "BLACK"), Group) %>%
+  verify(str_detect(SAMPLE_ID, "^.*-01$")) %>%
+  assert(not_na, Oncotree, is_wgd, Sex, PATIENT_ID, SAMPLE_ID) %>%
+  filter(Oncotree %in% c("UCEC")) %>%
+  mutate(Stage = case_when(
+    Staging %in% c("Stage I", "Stage IA", "Stage IB", "Stage IC") ~ "Stage I",
+    Staging %in% c("Stage II", "Stage IIA", "Stage IIB") ~ "Stage II",
+    Staging %in% c("Stage III", "Stage IIIA", "Stage IIIB", "Stage IIIC", "Stage IIIC1", "Stage IIIC2") ~ "Stage III",
+    Staging %in% c("Stage IV", "Stage IVA", "Stage IVB") ~ "Stage IV",
+    TRUE ~ "Unknown"
+  )) %>%
+  count(Group, Stage) %>%
+  group_by(Group) %>%
+  mutate(Percent = n / sum(n)) %>%
+  ungroup()
+
+tests <- tmp %>%
+  acast(Group ~ Stage, value.var = 'n', fill = 0) %>%
+  chisq.test(correct = FALSE)
+
+tmp %>%
+  ggplot() +
+  aes(x = Group,
+      y = Percent,
+      fill = Stage) +
+  geom_bar(stat = 'identity', position = 'stack') +
+  labs(y = '',
+       title = 'TCGA ENDOMETRIAL: Stage Distribution') +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     breaks = seq(0, 1, 0.1)) +
+  # Color matching
+  scale_fill_brewer(palette = "Accent") +
+  theme_gray(base_size = 16) +
+  theme(axis.title.x = element_blank())
+
+tests
+```
+
+#### Figure S3I
+```{r}
+tmp <- raw.data.wgd %>%
+  # Keep only columns/variables of interest
+  select(SAMPLE_ID = Sample.ID,
+         Metastatic.patient,
+         is_wgd,
+         Group = Race.Category,
+         Sample.Type,
+         Sex,
+         Cancer.Type,
+         Cancer.Type.Detailed) %>%
+  # Clean Group data
+  mutate(Group = case_when(
+    str_detect(Group, "Black") ~ "BLACK",
+    str_detect(Group, "White") ~ "WHITE",
+    TRUE ~ "OTHER"
+  )) %>%
+  # Clean WGD data
+  mutate(is_wgd = as.numeric(as.logical(is_wgd))) %>%
+  # Only consider decidable samples
+  filter(
+    !is.na(is_wgd),
+    Sample.Type == "Primary",
+    str_detect(Group, "WHITE|BLACK"),
+    str_detect(Sex, "Female|Male")
+  ) %>%
+  # Enforce data types
+  mutate(across(c(Group, Sex, Cancer.Type), factor)) %>% 
+  # Assertions of assumptions
+  assert(is_uniq, SAMPLE_ID) %>%
+  assert(in_set(0, 1), is_wgd) %>%
+  assert(in_set("Female", "Male"), Sex) %>%
+  assert(in_set("WHITE", "BLACK"), Group) %>%
+  assert(not_na, Cancer.Type, is_wgd, Sex, SAMPLE_ID) %>%
+  filter(Cancer.Type == "Non-Small Cell Lung Cancer") %>%
+  count(Group, is_wgd, Metastatic.patient) %>%
+  group_by(Metastatic.patient, Group) %>%
+  mutate(Percent = n / sum(n)) %>%
+  ungroup() %>%
+  mutate(Type = ifelse(Metastatic.patient, 'Metastatic Patients', 'Nonmetastatic Patients'))
+
+tests <- tmp %>%
+  group_by(Type) %>%
+  group_modify(~ {
+    .x %>%
+      acast(is_wgd ~ Group, value.var = 'n', fill = 0) %>%
+      fisher.test() %>%
+      broom::tidy()
+  }) %>%
+  mutate(label = paste0("p = ", round(p.value, digits = 3)))
+
+tmp %>%
+  filter(is_wgd == 1) %>%
+  ggplot() +
+  aes(
+    x = Type,
+    y = Percent,
+    fill = Group,
+    label = scales::percent(Percent, accuracy = 0.1)
+  ) +
+  geom_bar(stat = 'identity', position = 'dodge') +
+  geom_text(position = position_dodge(width = .9),
+            vjust = -0.5,
+            size = 6) +
+  geom_text(
+    data = tests,
+    mapping = aes(x = Type, y = -0.005, label = label),
+    vjust = 1,
+    position = position_dodge(width = .9),
+    inherit.aes = FALSE,
+    size = 6
+  ) +
+  labs(y = 'Frequency of WGD',
+       title = 'MSK-MET NSCLC: Patient Status by Race') +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     breaks = seq(0, 1, 0.1)) +
+  # Color matching
+  scale_fill_manual(values = c('BLACK' = '#6ad8f7', 'WHITE' = '#ff7879')) +
+  theme_gray(base_size = 16) +
+  theme(axis.title.x = element_blank())
+
+tests
+```
+
+#### Figure S3J
+```{r}
+tmp <- read_csv(
+    "data/tcga/TCGA_Demographics.csv",
+    col_select = c(
+      PATIENT_ID = bcr_patient_barcode,
+      Group = race,
+      Oncotree = type,
+      Sex = gender,
+      Hist = histological_type,
+      Staging = ajcc_pathologic_tumor_stage
+    )
+  ) %>%
+  inner_join(
+    read_csv(
+      "data/tcga/TCGA_arm_scores.csv",
+      col_select = c(SAMPLE_ID = Sample, Genome_doublings)
+    ) %>%
+      # Only consider Primary tumors
+      filter(str_detect(SAMPLE_ID, "^.*-01$")) %>%
+      # Extract the patient ID
+      mutate(PATIENT_ID = str_extract(SAMPLE_ID, "\\w{4}-\\w{2}-\\w{4}")),
+    by = c("PATIENT_ID")
+  ) %>%
+  mutate(is_wgd = Genome_doublings > 0) %>%
+  mutate(Sex = str_to_title(Sex)) %>%
+  mutate(Group = case_when(
+    str_detect(Group, "BLACK") ~ "BLACK",
+    str_detect(Group, "WHITE") ~ "WHITE",
+    TRUE ~ "OTHER"
+  )) %>%
+  # Only consider decidable samples
+  filter(
+    !is.na(is_wgd),
+    str_detect(SAMPLE_ID, "^.*-01$"),
+    str_detect(Group, "WHITE|BLACK"),
+    str_detect(Sex, "Female|Male")
+  ) %>%
+  # Assertions of assumptions
+  assert(is_uniq, SAMPLE_ID, PATIENT_ID) %>%
+  assert(in_set(0, 1), is_wgd) %>%
+  assert(in_set("Female", "Male"), Sex) %>%
+  assert(in_set("WHITE", "BLACK"), Group) %>%
+  verify(str_detect(SAMPLE_ID, "^.*-01$")) %>%
+  assert(not_na, Oncotree, is_wgd, Sex, PATIENT_ID, SAMPLE_ID) %>%
+  filter(Oncotree %in% c("LUAD", "LUSC")) %>%
+  mutate(Stage = case_when(
+    Staging %in% c("Stage I", "Stage IA", "Stage IB") ~ "Stage I",
+    Staging %in% c("Stage II", "Stage IIA", "Stage IIB") ~ "Stage II",
+    Staging %in% c("Stage III", "Stage IIIA", "Stage IIIB", "Stage IIIC") ~ "Stage III",
+    Staging %in% c("Stage IV") ~ "Stage IV",
+    TRUE ~ "Unknown"
+  )) %>%
+  count(Group, is_wgd, Stage) %>%
+  group_by(Stage, Group) %>%
+  mutate(Percent = n / sum(n)) %>%
+  ungroup()
+
+tests <- tmp %>%
+  group_by(Stage) %>%
+  group_modify(~ {
+    .x %>%
+      acast(is_wgd ~ Group, value.var = 'n', fill = 0) %>%
+      fisher.test() %>%
+      broom::tidy()
+  }) %>%
+  mutate(label = paste0("p = ", round(p.value, digits = 3)))
+
+tmp %>%
+  filter(is_wgd == 1) %>%
+  ggplot() +
+  aes(
+    x = Stage,
+    y = Percent,
+    fill = Group,
+    label = scales::percent(Percent, accuracy = 0.1)
+  ) +
+  geom_bar(stat = 'identity', position = 'dodge') +
+  geom_text(position = position_dodge(width = .9),
+            vjust = -0.5,
+            size = 6) +
+  geom_text(
+    data = tests,
+    mapping = aes(x = Stage, y = -0.005, label = label),
+    vjust = 1,
+    position = position_dodge(width = .9),
+    inherit.aes = FALSE,
+    size = 6
+  ) +
+  labs(y = 'Frequency of WGD',
+       title = 'TCGA NSCLC: Staging by Race') +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     breaks = seq(0, 1, 0.1)) +
+  # Color matching
+  scale_fill_manual(values = c('BLACK' = '#6ad8f7', 'WHITE' = '#ff7879')) +
+  theme_gray(base_size = 16) +
+  theme(axis.title.x = element_blank())
+
+tests
+```
+
+#### Figure S3K
+```{r}
+tmp <- raw.data.wgd %>%
+  # Keep only columns/variables of interest
+  select(SAMPLE_ID = Sample.ID,
+         Metastatic.patient,
+         is_wgd,
+         Group = Race.Category,
+         Sample.Type,
+         Sex,
+         Cancer.Type,
+         Cancer.Type.Detailed) %>%
+  # Clean Group data
+  mutate(Group = case_when(
+    str_detect(Group, "Black") ~ "BLACK",
+    str_detect(Group, "White") ~ "WHITE",
+    TRUE ~ "OTHER"
+  )) %>%
+  # Clean WGD data
+  mutate(is_wgd = as.numeric(as.logical(is_wgd))) %>%
+  # Only consider decidable samples
+  filter(
+    !is.na(is_wgd),
+    Sample.Type == "Primary",
+    str_detect(Group, "WHITE|BLACK"),
+    str_detect(Sex, "Female|Male")
+  ) %>%
+  # Enforce data types
+  mutate(across(c(Group, Sex, Cancer.Type), factor)) %>% 
+  # Assertions of assumptions
+  assert(is_uniq, SAMPLE_ID) %>%
+  assert(in_set(0, 1), is_wgd) %>%
+  assert(in_set("Female", "Male"), Sex) %>%
+  assert(in_set("WHITE", "BLACK"), Group) %>%
+  assert(not_na, Cancer.Type, Sex, SAMPLE_ID) %>%
+  filter(Cancer.Type == "Non-Small Cell Lung Cancer") %>%
+  count(Group, Metastatic.patient) %>%
+  group_by(Group) %>%
+  mutate(Percent = n / sum(n)) %>%
+  ungroup() %>%
+  mutate(Type = ifelse(Metastatic.patient, 'Metastatic Patients', 'Nonmetastatic Patients'))
+
+tests <- tmp %>%
+  acast(Group ~ Type, value.var = 'n', fill = 0) %>%
+  chisq.test(correct = FALSE)
+
+tmp %>%
+  ggplot() +
+  aes(x = Group,
+      y = Percent,
+      fill = Type) +
+  geom_bar(stat = 'identity', position = 'stack') +
+  labs(y = '',
+       title = 'MSK-MET NSCLC: Stage Distribution') +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     breaks = seq(0, 1, 0.1)) +
+  # Color matching
+  scale_fill_manual(values = c('Metastatic Patients' = '#ff0033', 'Nonmetastatic Patients' = '#0078ff')) +
+  theme_gray(base_size = 16) +
+  theme(axis.title.x = element_blank())
+
+tests
+```
+
+#### Figure S3L
+```{r}
+tmp <- read_csv(
+    "data/tcga/TCGA_Demographics.csv",
+    col_select = c(
+      PATIENT_ID = bcr_patient_barcode,
+      Group = race,
+      Oncotree = type,
+      Sex = gender,
+      Hist = histological_type,
+      Staging = ajcc_pathologic_tumor_stage
+    )
+  ) %>%
+  inner_join(
+    read_csv(
+      "data/tcga/TCGA_arm_scores.csv",
+      col_select = c(SAMPLE_ID = Sample, Genome_doublings)
+    ) %>%
+      # Only consider Primary tumors
+      filter(str_detect(SAMPLE_ID, "^.*-01$")) %>%
+      # Extract the patient ID
+      mutate(PATIENT_ID = str_extract(SAMPLE_ID, "\\w{4}-\\w{2}-\\w{4}")),
+    by = c("PATIENT_ID")
+  ) %>%
+  mutate(is_wgd = Genome_doublings > 0) %>%
+  mutate(Sex = str_to_title(Sex)) %>%
+  mutate(Group = case_when(
+    str_detect(Group, "BLACK") ~ "BLACK",
+    str_detect(Group, "WHITE") ~ "WHITE",
+    TRUE ~ "OTHER"
+  )) %>%
+  # Only consider decidable samples
+  filter(
+    !is.na(is_wgd),
+    str_detect(SAMPLE_ID, "^.*-01$"),
+    str_detect(Group, "WHITE|BLACK"),
+    str_detect(Sex, "Female|Male")
+  ) %>%
+  # Assertions of assumptions
+  assert(is_uniq, SAMPLE_ID, PATIENT_ID) %>%
+  assert(in_set(0, 1), is_wgd) %>%
+  assert(in_set("Female", "Male"), Sex) %>%
+  assert(in_set("WHITE", "BLACK"), Group) %>%
+  verify(str_detect(SAMPLE_ID, "^.*-01$")) %>%
+  assert(not_na, Oncotree, is_wgd, Sex, PATIENT_ID, SAMPLE_ID) %>%
+  filter(Oncotree %in% c("LUAD", "LUSC")) %>%
+  mutate(Stage = case_when(
+    Staging %in% c("Stage I", "Stage IA", "Stage IB") ~ "Stage I",
+    Staging %in% c("Stage II", "Stage IIA", "Stage IIB") ~ "Stage II",
+    Staging %in% c("Stage III", "Stage IIIA", "Stage IIIB", "Stage IIIC") ~ "Stage III",
+    Staging %in% c("Stage IV") ~ "Stage IV",
+    TRUE ~ "Unknown"
+  )) %>%
+  count(Group, Stage) %>%
+  group_by(Group) %>%
+  mutate(Percent = n / sum(n)) %>%
+  ungroup()
+
+tests <- tmp %>%
+  acast(Group ~ Stage, value.var = 'n', fill = 0) %>%
+  chisq.test(correct = FALSE)
+
+tmp %>%
+  ggplot() +
+  aes(x = Group,
+      y = Percent,
+      fill = Stage) +
+  geom_bar(stat = 'identity', position = 'stack') +
+  labs(y = '',
+       title = 'TCGA NSCLC: Stage Distribution') +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     breaks = seq(0, 1, 0.1)) +
+  # Color matching
+  scale_fill_brewer(palette = "Accent") +
+  theme_gray(base_size = 16) +
+  theme(axis.title.x = element_blank())
+
+tests
+```
+
+### Figure S4
+#### Figure S4A
+```{r, message=FALSE}
+tmp <- data.wgd.clean %>%
+  filter(
+    Cancer.Type.Detailed %in% c(
+      "Breast Invasive Ductal Carcinoma",
+      "Breast Invasive Lobular Carcinoma"
+    )
+  ) %>%
+  mutate(Type = case_when(
+    Cancer.Type.Detailed == "Breast Invasive Ductal Carcinoma" ~ "IDC",
+    Cancer.Type.Detailed == "Breast Invasive Lobular Carcinoma" ~ "ILC"
+  )) %>%
+  count(Group, Type, is_wgd) %>%
+  bind_rows(
+    tcga %>%
+              filter(Oncotree %in% c("BRCA")) %>%
+              filter(
+                Hist %in% c(
+                  "Infiltrating Ductal Carcinoma",
+                  "Infiltrating Lobular Carcinoma"
+                )
+              ) %>%
+              mutate(Type = case_when(
+    Hist == "Infiltrating Ductal Carcinoma" ~ "IDC",
+    Hist == "Infiltrating Lobular Carcinoma" ~ "ILC"
+  )) %>% count(Group, Type, is_wgd)) %>%
+  group_by(Group, Type, is_wgd) %>%
+  summarise(n = sum(n)) %>%
+  group_by(Group, Type) %>%
+  mutate(pct = prop.table(n)) %>%
+  ungroup()
+
+tests <- tmp %>%
+  group_by(Type) %>%
+  group_modify( ~ {
+    .x %>%
+      acast(is_wgd ~ Group, value.var = 'n', fill = 0) %>%
+      chisq.test(correct = FALSE) %>%
+      broom::tidy()
+  }) %>%
+  mutate(label = paste0("p = ", round(p.value, digits = 3)))
+
+tmp %>%
+  filter(is_wgd == 1) %>%
+  ggplot() +
+  aes(
+    x = Type,
+    y = pct,
+    fill = Group,
+    label = scales::percent(pct, accuracy = 0.1)
+  ) +
+  geom_bar(stat = 'identity', position = 'dodge') +
+  geom_text(position = position_dodge(width = .9),
+            vjust = -0.5,
+            size = 6) +
+  geom_text(
+    data = tests,
+    mapping = aes(x = Type, y = -0.01, label = label),
+    vjust = 1,
+    position = position_dodge(width = .9),
+    inherit.aes = FALSE,
+    size = 6
+  ) +
+  labs(y = 'Frequency of WGD',
+       title = 'MSK-MET/TCGA BREAST Subtypes: WGD Frequency') +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     breaks = seq(0, 1, 0.1)) +
+  # Color matching
+  scale_fill_manual(values = c('BLACK' = '#6ad8f7', 'WHITE' = '#ff7879')) +
+  theme_gray(base_size = 16) +
+  theme(axis.title.x = element_blank())
+
+tests
+```
+
+#### Figure S4B
+```{r, message=FALSE}
+tmp <- data.wgd.clean %>%
+  filter(
+    Cancer.Type.Detailed %in% c(
+      "Uterine Serous Carcinoma/Uterine Papillary Serous Carcinoma",
+      "Uterine Endometrioid Carcinoma"
+    )
+  ) %>%
+  mutate(Type = case_when(
+    Cancer.Type.Detailed == "Uterine Serous Carcinoma/Uterine Papillary Serous Carcinoma" ~ "Serous",
+    Cancer.Type.Detailed == "Uterine Endometrioid Carcinoma" ~ "Endometrioid"
+  )) %>%
+  count(Group, Type, is_wgd) %>%
+  bind_rows(
+    tcga %>%
+              filter(Oncotree %in% c("UCEC")) %>%
+              filter(
+                Hist %in% c(
+                  "Serous endometrial adenocarcinoma",
+                  "Endometrioid endometrial adenocarcinoma"
+                )
+              ) %>%
+              mutate(Type = case_when(
+    Hist == "Serous endometrial adenocarcinoma" ~ "Serous",
+    Hist == "Endometrioid endometrial adenocarcinoma" ~ "Endometrioid"
+  )) %>% count(Group, Type, is_wgd)) %>%
+  group_by(Group, Type, is_wgd) %>%
+  summarise(n = sum(n)) %>%
+  group_by(Group, Type) %>%
+  mutate(pct = prop.table(n)) %>%
+  ungroup()
+
+tests <- tmp %>%
+  group_by(Type) %>%
+  group_modify( ~ {
+    .x %>%
+      acast(is_wgd ~ Group, value.var = 'n', fill = 0) %>%
+      chisq.test(correct = FALSE) %>%
+      broom::tidy()
+  }) %>%
+  mutate(label = paste0("p = ", round(p.value, digits = 3)))
+
+tmp %>%
+  filter(is_wgd == 1) %>%
+  ggplot() +
+  aes(
+    x = Type,
+    y = pct,
+    fill = Group,
+    label = scales::percent(pct, accuracy = 0.1)
+  ) +
+  geom_bar(stat = 'identity', position = 'dodge') +
+  geom_text(position = position_dodge(width = .9),
+            vjust = -0.5,
+            size = 6) +
+  geom_text(
+    data = tests,
+    mapping = aes(x = Type, y = -0.01, label = label),
+    vjust = 1,
+    position = position_dodge(width = .9),
+    inherit.aes = FALSE,
+    size = 6
+  ) +
+  labs(y = 'Frequency of WGD',
+       title = 'MSK-MET/TCGA ENDOMETRIAL Subtypes: WGD Frequency') +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     breaks = seq(0, 1, 0.1)) +
+  # Color matching
+  scale_fill_manual(values = c('BLACK' = '#6ad8f7', 'WHITE' = '#ff7879')) +
+  theme_gray(base_size = 16) +
+  theme(axis.title.x = element_blank())
+
+tests
+```
+
+#### Figure S4C
+```{r, message=FALSE}
+tmp <- data.wgd.clean %>%
+  filter(
+    Cancer.Type.Detailed %in% c(
+      "Lung Adenocarcinoma",
+      "Lung Squamous Cell Carcinoma"
+    )
+  ) %>%
+  mutate(Type = case_when(
+    Cancer.Type.Detailed == "Lung Adenocarcinoma" ~ "Adenocarcinoma",
+    Cancer.Type.Detailed == "Lung Squamous Cell Carcinoma" ~ "Squamous Cell"
+  )) %>%
+  count(Group, Type, is_wgd) %>%
+  bind_rows(
+    tcga %>%
+              filter(Oncotree %in% c("LUAD", "LUSC")) %>%
+              filter(
+                Hist %in% c(
+                  "Lung Adenocarcinoma",
+                  "Lung Squamous Cell Carcinoma"
+                )
+              ) %>%
+              mutate(Type = case_when(
+    Hist == "Lung Adenocarcinoma" ~ "Adenocarcinoma",
+    Hist == "Lung Squamous Cell Carcinoma" ~ "Squamous Cell"
+  )) %>% count(Group, Type, is_wgd)) %>%
+  group_by(Group, Type, is_wgd) %>%
+  summarise(n = sum(n)) %>%
+  group_by(Group, Type) %>%
+  mutate(pct = prop.table(n)) %>%
+  ungroup()
+
+tests <- tmp %>%
+  group_by(Type) %>%
+  group_modify( ~ {
+    .x %>%
+      acast(is_wgd ~ Group, value.var = 'n', fill = 0) %>%
+      chisq.test(correct = FALSE) %>%
+      broom::tidy()
+  }) %>%
+  mutate(label = paste0("p = ", round(p.value, digits = 3)))
+
+tmp %>%
+  filter(is_wgd == 1) %>%
+  ggplot() +
+  aes(
+    x = Type,
+    y = pct,
+    fill = Group,
+    label = scales::percent(pct, accuracy = 0.1)
+  ) +
+  geom_bar(stat = 'identity', position = 'dodge') +
+  geom_text(position = position_dodge(width = .9),
+            vjust = -0.5,
+            size = 6) +
+  geom_text(
+    data = tests,
+    mapping = aes(x = Type, y = -0.01, label = label),
+    vjust = 1,
+    position = position_dodge(width = .9),
+    inherit.aes = FALSE,
+    size = 6
+  ) +
+  labs(y = 'Frequency of WGD',
+       title = 'MSK-MET/TCGA NSCLC Subtypes: WGD Frequency') +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     breaks = seq(0, 1, 0.1)) +
+  # Color matching
+  scale_fill_manual(values = c('BLACK' = '#6ad8f7', 'WHITE' = '#ff7879')) +
+  theme_gray(base_size = 16) +
+  theme(axis.title.x = element_blank())
+
+tests
+```
+
+### Figure S5
+#### Figure S5A
+```{r}
+tmp <- data.wgd.ancestry.clean %>%
+  rename(Ancestry = ancestry_label) %>%
+  count(Ancestry, is_wgd) %>%
+  group_by(Ancestry) %>%
+  mutate(pct = prop.table(n)) %>%
+  mutate(Source = "MSK-MET")
+
+tests <- tmp %>%
+  group_by(Source) %>%
+  group_modify( ~ {
+    .x %>%
+      acast(is_wgd ~ Ancestry, value.var = 'n', fill = 0) %>%
+      chisq.test(correct = FALSE) %>%
+      broom::tidy()
+  }) %>%
+  mutate(label = paste0("p = ", round(p.value, digits = 3)))
+
+tmp %>%
+  filter(is_wgd == 1) %>%
+  ggplot() +
+  aes(x = Source, y = pct, fill = Ancestry, label = scales::percent(pct, accuracy = 0.1)) +
+  geom_bar(stat = 'identity', position = 'dodge') +
+  geom_text(position = position_dodge(width = .9),
+            vjust = -0.5,
+            size = 6) +
+  geom_text(
+    data = tests,
+    mapping = aes(x = Source, y = -0.01, label = label),
+    vjust = 1,
+    position = position_dodge(width = .9),
+    inherit.aes = FALSE,
+    size = 6
+  ) +
+  labs(y = 'Frequency of WGD',
+       title = 'Pan-cancer WGD') +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     breaks = seq(0, 1, 0.1)) +
+  # Color matching
+  scale_fill_manual(values = c('AFR' = '#6ad8f7', 'EUR' = '#ff7879')) +
+  theme_gray(base_size = 16) +
+  theme(axis.title.x = element_blank())
+
+tests
+```
+
+#### Figure S5B
+```{r}
+tmp <- data.wgd.ancestry.clean %>%
+  rename(Ancestry = ancestry_label) %>%
+  filter(
+    Cancer.Type %in% c(
+      "Breast Cancer",
+      "Endometrial Cancer",
+      "Non-Small Cell Lung Cancer"
+    )
+  ) %>%
+  mutate(Type = fct_collapse(
+    Cancer.Type,
+    `Breast` = c("Breast Cancer"),
+    `Endometrial` = c("Endometrial Cancer"),
+    `NSCLC` = c("Non-Small Cell Lung Cancer")
+  )) %>%
+  count(Ancestry, Type, is_wgd) %>%
+  group_by(Ancestry, Type) %>%
+  mutate(pct = prop.table(n)) %>%
+  mutate(Source = "MSK-MET")
+
+tests <- tmp %>%
+  group_by(Source, Type) %>%
+  group_modify( ~ {
+    .x %>%
+      acast(is_wgd ~ Ancestry, value.var = 'n', fill = 0) %>%
+      chisq.test(correct = FALSE) %>%
+      broom::tidy()
+  }) %>%
+  mutate(label = paste0("p = ", round(p.value, digits = 3)))
+
+tmp %>%
+  filter(is_wgd == 1) %>%
+  ggplot() +
+  aes(
+    x = Source,
+    y = pct,
+    fill = Ancestry,
+    label = scales::percent(pct, accuracy = 0.1)
+  ) +
+  geom_bar(stat = 'identity', position = 'dodge') +
+  geom_text(position = position_dodge(width = .9),
+            vjust = -0.5,
+            size = 6) +
+  geom_text(
+    data = tests,
+    mapping = aes(x = Source, y = -0.01, label = label),
+    vjust = 1,
+    position = position_dodge(width = .9),
+    inherit.aes = FALSE,
+    size = 6
+  ) +
+  labs(y = 'Frequency of WGD',
+       title = 'WGD Frequency by Cancer Type') +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     breaks = seq(0, 1, 0.1)) +
+  # Color matching
+  scale_fill_manual(values = c('AFR' = '#6ad8f7', 'EUR' = '#ff7879')) +
+  theme_gray(base_size = 16) +
+  theme(axis.title.x = element_blank()) +
+  facet_wrap(~ Type)
+
+tests
+```
+
+### Figure S6
+#### Figure S6A
+```{r}
+data.clinical.patient.clean %>%
+  left_join(data.wgd.clean %>% select(SAMPLE_ID, Group, Cancer.Type),
+            by = c('SAMPLE_ID' = 'SAMPLE_ID')) %>%
+  filter(Cancer.Type == "Breast Cancer") %>%
+  mutate(
+    MONTHS = OS_MONTHS / dmonths(1),
+    STATUS = str_detect(OS_STATUS, 'DECEASED'),
+    GROUP = Group
+  ) %>%
+  select(MONTHS, STATUS, GROUP) %>%
+  survfit2(Surv(MONTHS, STATUS) ~ GROUP, data = .) %>%
+  ggsurvfit() +
+  add_risktable() +
+  add_pvalue(caption = "Log-rank {p.value}") +
+  labs(x = "Months",
+       y = "Overall Survival",
+       title = "Breast: Patient Race") +
+  scale_y_continuous(
+    labels = scales::percent,
+    limits = c(0, 1),
+    expand = expansion(0, 0)
+  ) +
+  scale_x_continuous(breaks = seq(0, 12 * 6, 12), limits = c(0, 12 * 6)) +
+  scale_color_manual(values = c('BLACK' = '#6ad8f7', 'WHITE' = '#ff7879'))
+```
+
+#### Figure S6B
+```{r}
+data.clinical.patient.clean %>%
+  left_join(
+    data.wgd.clean %>% select(SAMPLE_ID, Group, Cancer.Type, Cancer.Type.Detailed),
+    by = c('SAMPLE_ID' = 'SAMPLE_ID')
+  ) %>%
+  filter(
+    Cancer.Type == "Endometrial Cancer",!str_detect(Cancer.Type.Detailed, "Uterine Carcinosarcoma")
+  ) %>%
+  mutate(
+    MONTHS = OS_MONTHS / dmonths(1),
+    STATUS = str_detect(OS_STATUS, 'DECEASED'),
+    GROUP = Group
+  ) %>% 
+  select(MONTHS, STATUS, GROUP) %>%
+  survfit2(Surv(MONTHS, STATUS) ~ GROUP, data = .) %>%
+  ggsurvfit() +
+  add_risktable() +
+  add_pvalue(caption = "Log-rank {p.value}") +
+  labs(x = "Months",
+       y = "Overall Survival",
+       title = "Endometrial: Patient Race") +
+  scale_y_continuous(
+    labels = scales::percent,
+    limits = c(0, 1),
+    expand = expansion(0, 0)
+  ) +
+  scale_x_continuous(breaks = seq(0, 12 * 6, 12), limits = c(0, 12 * 6)) +
+  scale_color_manual(values = c('BLACK' = '#6ad8f7', 'WHITE' = '#ff7879'))
+```
+
+#### Figure S6C
+```{r}
+data.clinical.patient.clean %>%
+  left_join(data.wgd.clean %>% select(SAMPLE_ID, Group, Cancer.Type),
+            by = c('SAMPLE_ID' = 'SAMPLE_ID')) %>%
+  filter(Cancer.Type == "Non-Small Cell Lung Cancer") %>%
+  mutate(
+    MONTHS = OS_MONTHS / dmonths(1),
+    STATUS = str_detect(OS_STATUS, 'DECEASED'),
+    GROUP = Group
+  ) %>%
+  select(MONTHS, STATUS, GROUP) %>%
+  survfit2(Surv(MONTHS, STATUS) ~ GROUP, data = .) %>%
+  ggsurvfit() +
+  add_risktable() +
+  add_pvalue(caption = "Log-rank {p.value}") +
+  labs(x = "Months",
+       y = "Overall Survival",
+       title = "NSCLC: Patient Race") +
+  scale_y_continuous(
+    labels = scales::percent,
+    limits = c(0, 1),
+    expand = expansion(0, 0)
+  ) +
+  scale_x_continuous(breaks = seq(0, 12 * 6, 12), limits = c(0, 12 * 6)) +
+  scale_color_manual(values = c('BLACK' = '#6ad8f7', 'WHITE' = '#ff7879'))
+```
+
+#### Figure S6D
+```{r}
+data.clinical.patient.clean %>%
+  left_join(
+    data.wgd.clean %>% select(SAMPLE_ID, is_wgd, Cancer.Type, Cancer.Type.Detailed),
+    by = c('SAMPLE_ID' = 'SAMPLE_ID')
+  ) %>%
+  filter(
+    Cancer.Type == "Endometrial Cancer",
+    !str_detect(Cancer.Type.Detailed, "Uterine Carcinosarcoma")
+  ) %>%
+  mutate(
+    MONTHS = OS_MONTHS / dmonths(1),
+    STATUS = str_detect(OS_STATUS, 'DECEASED'),
+    WGD = ifelse(is_wgd == 1, 'WGD', 'No WGD')
+  ) %>% 
+  select(MONTHS, STATUS, WGD) %>%
+  survfit2(Surv(MONTHS, STATUS) ~ WGD, data = .) %>%
+  ggsurvfit() +
+  add_risktable() +
+  add_pvalue(caption = "Log-rank {p.value}") +
+  labs(x = "Months",
+       y = "Overall Survival",
+       title = "Endometrial: WGD Status") +
+  scale_y_continuous(
+    labels = scales::percent,
+    limits = c(0, 1),
+    expand = expansion(0, 0)
+  ) +
+  scale_x_continuous(breaks = seq(0, 12 * 6, 12), limits = c(0, 12 * 6)) +
+  scale_color_manual(values = c('No WGD' = '#6ad8f7', 'WGD' = '#ff7879'))
+```
+
+#### Figure S6E
+```{r}
+data.clinical.patient.clean %>%
+  left_join(
+    data.wgd.clean %>% select(SAMPLE_ID, is_wgd, Group, Cancer.Type, Cancer.Type.Detailed),
+    by = c('SAMPLE_ID' = 'SAMPLE_ID')
+  ) %>%
+  filter(
+    Cancer.Type == "Endometrial Cancer",
+    !str_detect(Cancer.Type.Detailed, "Uterine Carcinosarcoma"),
+    is_wgd == 0
+  ) %>%
+  mutate(
+    MONTHS = OS_MONTHS / dmonths(1),
+    STATUS = str_detect(OS_STATUS, 'DECEASED'),
+    GROUP = Group
+  ) %>% 
+  select(MONTHS, STATUS, GROUP) %>%
+  survfit2(Surv(MONTHS, STATUS) ~ GROUP, data = .) %>%
+  ggsurvfit() +
+  add_risktable() +
+  add_pvalue(caption = "Log-rank {p.value}") +
+  labs(x = "Months",
+       y = "Overall Survival",
+       title = "Endometrial: Race (No WGD)") +
+  scale_y_continuous(
+    labels = scales::percent,
+    limits = c(0, 1),
+    expand = expansion(0, 0)
+  ) +
+  scale_x_continuous(breaks = seq(0, 12 * 6, 12), limits = c(0, 12 * 6)) +
+  scale_color_manual(values = c('BLACK' = '#6ad8f7', 'WHITE' = '#ff7879'))
+```
+
+#### Figure S6F
+```{r}
+data.clinical.patient.clean %>%
+  left_join(data.wgd.clean %>% select(SAMPLE_ID, is_wgd, Group, Cancer.Type, Cancer.Type.Detailed),
+            by = c('SAMPLE_ID' = 'SAMPLE_ID')) %>%
+  filter(Cancer.Type == "Endometrial Cancer",
+         !str_detect(Cancer.Type.Detailed, "Uterine Carcinosarcoma"), is_wgd == 1) %>%
+  mutate(
+    MONTHS = OS_MONTHS / dmonths(1),
+    STATUS = str_detect(OS_STATUS, 'DECEASED'),
+    GROUP = Group
+  ) %>%
+  select(MONTHS, STATUS, GROUP) %>%
+  survfit2(Surv(MONTHS, STATUS) ~ GROUP, data = .) %>%
+  ggsurvfit() +
+  add_risktable() +
+  add_pvalue(caption = "Log-rank {p.value}") +
+  labs(x = "Months",
+       y = "Overall Survival",
+       title = "Endometrial: Race (WGD)") +
+  scale_y_continuous(
+    labels = scales::percent,
+    limits = c(0, 1),
+    expand = expansion(0, 0)
+  ) +
+  scale_x_continuous(breaks = seq(0, 12 * 6, 12), limits = c(0, 12 * 6)) +
+  scale_color_manual(values = c('BLACK' = '#6ad8f7', 'WHITE' = '#ff7879'))
+```
+
+### Figure S7
+#### Figure S7A
+```{r}
+data.clinical.patient.clean %>%
+  left_join(data.mutations.clean %>% select(SAMPLE_ID, TP53_Mut),
+            by = c('SAMPLE_ID' = 'SAMPLE_ID')) %>%
+  mutate(
+    MONTHS = OS_MONTHS / dmonths(1),
+    STATUS = str_detect(OS_STATUS, 'DECEASED'),
+    TP53 = ifelse(TP53_Mut == 1, "TP53 Mutant", "TP53 WT")
+  ) %>%
+  select(MONTHS, STATUS, TP53) %>%
+  survfit2(Surv(MONTHS, STATUS) ~ TP53, data = .) %>%
+  ggsurvfit() +
+  add_risktable() +
+  add_pvalue(caption = "Log-rank {p.value}") +
+  labs(x = "Months",
+       y = "Overall Survival",
+       title = "Pan-cancer: TP53 Status") +
+  scale_y_continuous(
+    labels = scales::percent,
+    limits = c(0, 1),
+    expand = expansion(0, 0)
+  ) +
+  scale_x_continuous(breaks = seq(0, 12 * 6, 12), limits = c(0, 12 * 6)) +
+  scale_color_manual(values = c('TP53 WT' = '#6ad8f7', 'TP53 Mutant' = '#ff7879'))
+```
+
+#### Figure S7B
+```{r}
+data.clinical.patient.clean %>%
+  left_join(data.wgd.clean %>% select(SAMPLE_ID, is_wgd, Group),
+            by = c('SAMPLE_ID' = 'SAMPLE_ID')) %>%
+  left_join(data.mutations.clean %>% select(SAMPLE_ID, TP53_Mut),
+            by = c('SAMPLE_ID' = 'SAMPLE_ID')) %>%
+  filter(TP53_Mut == 0) %>%
+  mutate(
+    MONTHS = OS_MONTHS / dmonths(1),
+    STATUS = str_detect(OS_STATUS, 'DECEASED'),
+    GROUP = Group
+  ) %>%
+  select(MONTHS, STATUS, GROUP) %>%
+  survfit2(Surv(MONTHS, STATUS) ~ GROUP, data = .) %>%
+  ggsurvfit() +
+  add_risktable() +
+  add_pvalue(caption = "Log-rank {p.value}") +
+  labs(x = "Months",
+       y = "Overall Survival",
+       title = "Pan-cancer TP53 WT: Patient Race") +
+  scale_y_continuous(
+    labels = scales::percent,
+    limits = c(0, 1),
+    expand = expansion(0, 0)
+  ) +
+  scale_x_continuous(breaks = seq(0, 12 * 6, 12), limits = c(0, 12 * 6)) +
+  scale_color_manual(values = c('BLACK' = '#6ad8f7', 'WHITE' = '#ff7879'))
+```
+
+#### Figure S7C
+```{r}
+data.clinical.patient.clean %>%
+  left_join(data.wgd.clean %>% select(SAMPLE_ID, is_wgd),
+            by = c('SAMPLE_ID' = 'SAMPLE_ID')) %>%
+  left_join(data.mutations.clean %>% select(SAMPLE_ID, TP53_Mut),
+            by = c('SAMPLE_ID' = 'SAMPLE_ID')) %>%
+  filter(TP53_Mut == 0) %>%
+  mutate(
+    MONTHS = OS_MONTHS / dmonths(1),
+    STATUS = str_detect(OS_STATUS, 'DECEASED'),
+    WGD = ifelse(is_wgd == 1, 'WGD', 'No WGD')
+  ) %>%
+  select(MONTHS, STATUS, WGD) %>%
+  survfit2(Surv(MONTHS, STATUS) ~ WGD, data = .) %>%
+  ggsurvfit() +
+  add_risktable() +
+  add_pvalue(caption = "Log-rank {p.value}") +
+  labs(x = "Months",
+       y = "Overall Survival",
+       title = "Pan-cancer TP53 WT: WGD Status") +
+  scale_y_continuous(
+    labels = scales::percent,
+    limits = c(0, 1),
+    expand = expansion(0, 0)
+  ) +
+  scale_x_continuous(breaks = seq(0, 12 * 6, 12), limits = c(0, 12 * 6)) +
+  scale_color_manual(values = c('No WGD' = '#6ad8f7', 'WGD' = '#ff7879'))
+```
+
+#### Figure S7D
+```{r}
+data.clinical.patient.clean %>%
+  left_join(data.wgd.clean %>% select(SAMPLE_ID, is_wgd, Group),
+            by = c('SAMPLE_ID' = 'SAMPLE_ID')) %>%
+  left_join(data.mutations.clean %>% select(SAMPLE_ID, TP53_Mut),
+            by = c('SAMPLE_ID' = 'SAMPLE_ID')) %>%
+  filter(TP53_Mut == 0, is_wgd == 0) %>%
+  mutate(
+    MONTHS = OS_MONTHS / dmonths(1),
+    STATUS = str_detect(OS_STATUS, 'DECEASED'),
+    GROUP = Group
+  ) %>%
+  select(MONTHS, STATUS, GROUP) %>%
+  survfit2(Surv(MONTHS, STATUS) ~ GROUP, data = .) %>%
+  ggsurvfit() +
+  add_risktable() +
+  add_pvalue(caption = "Log-rank {p.value}") +
+  labs(x = "Months",
+       y = "Overall Survival",
+       title = "Pan-cancer TP53 WT: Patient Race (No WGD)") +
+  scale_y_continuous(
+    labels = scales::percent,
+    limits = c(0, 1),
+    expand = expansion(0, 0)
+  ) +
+  scale_x_continuous(breaks = seq(0, 12 * 6, 12), limits = c(0, 12 * 6)) +
+  scale_color_manual(values = c('BLACK' = '#6ad8f7', 'WHITE' = '#ff7879'))
+```
+
+#### Figure S7E
+```{r}
+data.clinical.patient.clean %>%
+  left_join(data.wgd.clean %>% select(SAMPLE_ID, is_wgd, Group),
+            by = c('SAMPLE_ID' = 'SAMPLE_ID')) %>%
+  left_join(data.mutations.clean %>% select(SAMPLE_ID, TP53_Mut),
+            by = c('SAMPLE_ID' = 'SAMPLE_ID')) %>%
+  filter(TP53_Mut == 0, is_wgd == 1) %>%
+  mutate(
+    MONTHS = OS_MONTHS / dmonths(1),
+    STATUS = str_detect(OS_STATUS, 'DECEASED'),
+    GROUP = Group
+  ) %>%
+  select(MONTHS, STATUS, GROUP) %>%
+  survfit2(Surv(MONTHS, STATUS) ~ GROUP, data = .) %>%
+  ggsurvfit() +
+  add_risktable() +
+  add_pvalue(caption = "Log-rank {p.value}") +
+  labs(x = "Months",
+       y = "Overall Survival",
+       title = "Pan-cancer TP53 WT: Patient Race (WGD)") +
+  scale_y_continuous(
+    labels = scales::percent,
+    limits = c(0, 1),
+    expand = expansion(0, 0)
+  ) +
+  scale_x_continuous(breaks = seq(0, 12 * 6, 12), limits = c(0, 12 * 6)) +
+  scale_color_manual(values = c('BLACK' = '#6ad8f7', 'WHITE' = '#ff7879'))
+```
+
+#### Figure S7F
+```{r}
+data.clinical.patient.clean %>%
+  left_join(data.wgd.clean %>% select(SAMPLE_ID, is_wgd, Group),
+            by = c('SAMPLE_ID' = 'SAMPLE_ID')) %>%
+  left_join(data.mutations.clean %>% select(SAMPLE_ID, TP53_Mut),
+            by = c('SAMPLE_ID' = 'SAMPLE_ID')) %>%
+  filter(TP53_Mut == 1) %>%
+  mutate(
+    MONTHS = OS_MONTHS / dmonths(1),
+    STATUS = str_detect(OS_STATUS, 'DECEASED'),
+    GROUP = Group
+  ) %>%
+  select(MONTHS, STATUS, GROUP) %>%
+  survfit2(Surv(MONTHS, STATUS) ~ GROUP, data = .) %>%
+  ggsurvfit() +
+  add_risktable() +
+  add_pvalue(caption = "Log-rank {p.value}") +
+  labs(x = "Months",
+       y = "Overall Survival",
+       title = "Pan-cancer TP53 Mutant: Patient Race") +
+  scale_y_continuous(
+    labels = scales::percent,
+    limits = c(0, 1),
+    expand = expansion(0, 0)
+  ) +
+  scale_x_continuous(breaks = seq(0, 12 * 6, 12), limits = c(0, 12 * 6)) +
+  scale_color_manual(values = c('BLACK' = '#6ad8f7', 'WHITE' = '#ff7879'))
+```
+
+#### Figure S7G
+```{r}
+data.clinical.patient.clean %>%
+  left_join(data.wgd.clean %>% select(SAMPLE_ID, is_wgd),
+            by = c('SAMPLE_ID' = 'SAMPLE_ID')) %>%
+  left_join(data.mutations.clean %>% select(SAMPLE_ID, TP53_Mut),
+            by = c('SAMPLE_ID' = 'SAMPLE_ID')) %>%
+  filter(TP53_Mut == 1) %>%
+  mutate(
+    MONTHS = OS_MONTHS / dmonths(1),
+    STATUS = str_detect(OS_STATUS, 'DECEASED'),
+    WGD = ifelse(is_wgd == 1, 'WGD', 'No WGD')
+  ) %>%
+  select(MONTHS, STATUS, WGD) %>%
+  survfit2(Surv(MONTHS, STATUS) ~ WGD, data = .) %>%
+  ggsurvfit() +
+  add_risktable() +
+  add_pvalue(caption = "Log-rank {p.value}") +
+  labs(x = "Months",
+       y = "Overall Survival",
+       title = "Pan-cancer TP53 Mutant: WGD Status") +
+  scale_y_continuous(
+    labels = scales::percent,
+    limits = c(0, 1),
+    expand = expansion(0, 0)
+  ) +
+  scale_x_continuous(breaks = seq(0, 12 * 6, 12), limits = c(0, 12 * 6)) +
+  scale_color_manual(values = c('No WGD' = '#6ad8f7', 'WGD' = '#ff7879'))
+```
+
+#### Figure S7H
+```{r}
+data.clinical.patient.clean %>%
+  left_join(data.wgd.clean %>% select(SAMPLE_ID, is_wgd, Group),
+            by = c('SAMPLE_ID' = 'SAMPLE_ID')) %>%
+  left_join(data.mutations.clean %>% select(SAMPLE_ID, TP53_Mut),
+            by = c('SAMPLE_ID' = 'SAMPLE_ID')) %>%
+  filter(TP53_Mut == 1, is_wgd == 0) %>%
+  mutate(
+    MONTHS = OS_MONTHS / dmonths(1),
+    STATUS = str_detect(OS_STATUS, 'DECEASED'),
+    GROUP = Group
+  ) %>%
+  select(MONTHS, STATUS, GROUP) %>%
+  survfit2(Surv(MONTHS, STATUS) ~ GROUP, data = .) %>%
+  ggsurvfit() +
+  add_risktable() +
+  add_pvalue(caption = "Log-rank {p.value}") +
+  labs(x = "Months",
+       y = "Overall Survival",
+       title = "Pan-cancer TP53 Mutant: Patient Race (No WGD)") +
+  scale_y_continuous(
+    labels = scales::percent,
+    limits = c(0, 1),
+    expand = expansion(0, 0)
+  ) +
+  scale_x_continuous(breaks = seq(0, 12 * 6, 12), limits = c(0, 12 * 6)) +
+  scale_color_manual(values = c('BLACK' = '#6ad8f7', 'WHITE' = '#ff7879'))
+```
+
+#### Figure S7H
+```{r}
+data.clinical.patient.clean %>%
+  left_join(data.wgd.clean %>% select(SAMPLE_ID, is_wgd, Group),
+            by = c('SAMPLE_ID' = 'SAMPLE_ID')) %>%
+  left_join(data.mutations.clean %>% select(SAMPLE_ID, TP53_Mut),
+            by = c('SAMPLE_ID' = 'SAMPLE_ID')) %>%
+  filter(TP53_Mut == 1, is_wgd == 1) %>%
+  mutate(
+    MONTHS = OS_MONTHS / dmonths(1),
+    STATUS = str_detect(OS_STATUS, 'DECEASED'),
+    GROUP = Group
+  ) %>%
+  select(MONTHS, STATUS, GROUP) %>%
+  survfit2(Surv(MONTHS, STATUS) ~ GROUP, data = .) %>%
+  ggsurvfit() +
+  add_risktable() +
+  add_pvalue(caption = "Log-rank {p.value}") +
+  labs(x = "Months",
+       y = "Overall Survival",
+       title = "Pan-cancer TP53 Mutant: Patient Race (WGD)") +
+  scale_y_continuous(
+    labels = scales::percent,
+    limits = c(0, 1),
+    expand = expansion(0, 0)
+  ) +
+  scale_x_continuous(breaks = seq(0, 12 * 6, 12), limits = c(0, 12 * 6)) +
+  scale_color_manual(values = c('BLACK' = '#6ad8f7', 'WHITE' = '#ff7879'))
+```
+
+## Session Info and Citations
+```{r}
+sessionInfo()
+```
+
+```{r}
+packages_in_use <- c( names( sessionInfo()$otherPkgs ) )
+the_citations_list <- lapply( X=packages_in_use, FUN=citation)
+the_citations_list
+```
