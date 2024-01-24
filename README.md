@@ -14,18 +14,31 @@ Some of the data used in this project are not publicly available. Below is a bre
 + `pancan_pcawg_2020_clinical_data.csv`: Clinical data for PCAWG, publicly available
 + `TCGA_Demographics.csv` and `TCGA_arm_scores.csv`: Clinical and aneuploidy data for TCGA, publicly available
 
-## Package Management
+## System Requirements
+### Software Dependencies
 
-This project uses `renv` for package management. It should be sufficient to first install `renv` from within an R console:
+This project uses `renv` for dependency management. It should be sufficient to first install `renv` from within an R console:
 
 ```r
 install.packages("renv")
 ```
 
-Then to install all the necessary packages, from an R console in the root of this project:
+Then to install all dependencies, from an R console in the root of this project:
 
 ```r
 renv::restore()
 ```
 
-This will install all the necessary packages and place then in a directory under `renv/library/` -- which will be loaded by default in most cases, but can be forced via `source("renv/activate.R")`.
+This will install the specified versions of dependencies as listed in the `renv.lock` file, placing them in a directory under `renv/library/` -- which will often be loaded by default upon opening the RProject, but can be forced via `source("renv/activate.R")` from within an R console. The dependency installation process can take up to an hour if compiling all dependencies from source, but typically takes less than 30 minutes.
+
+### Operating Systems
+
+This project has been successfully run on Windows, Linux (Ubuntu family), and MacOS (Intel based) distributions. 
+
+### Hardware
+
+No non-standard hardware is required to run this project.
+
+## Running the Project
+
+If you have RStudio installed, you can double-click the `wgd_disparities.Rproj` file to open the project from your file manager. Once the project is open in RStudio, open the `wgd_disparities.Rmd` file. Just above where the file opens there will be a button labeled `Knit` -- clicking this button will run the code and produce an HTML report called `wgd_disparities.html`. Open this report in your preferred web browser to read the report. Running the project can take 20-40 minutes on a normal desktop computer.
