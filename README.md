@@ -1,6 +1,6 @@
 # An elevated rate of whole-genome duplication events in cancers from Black patients
 
-This repository represents the computational analysis for the investigation of WGD racial disparities as conducted in the Sheltzer Lab.
+This repository represents the computational analysis for the investigation of WGD racial disparities as conducted in the Sheltzer Lab. The associated preprint is available on medRxiv at <https://doi.org/10.1101/2023.11.10.23298349>.
 
 ## Data Availability
 
