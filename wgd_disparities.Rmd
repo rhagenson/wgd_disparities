@@ -2708,7 +2708,7 @@ mutagen.proportions.nsclc %>%
    columns = c(BLACK.mean, WHITE.mean)
   ) %>%
   fmt(
-    columns = `p.adj`,
+    columns = c(`p`, `p.adj`),
     fns = function(q)
       gtsummary::style_pvalue(q,
                               decimals = 3)
@@ -2721,6 +2721,10 @@ mutagen.proportions.nsclc %>%
       columns = `p.adj`,
       rows = `p.adj` < 0.05
     )
+  ) %>%
+  fmt_number(
+    columns = c(BLACK.mean, WHITE.mean, statistic),
+    decimals = 2
   ) %>%
   opt_stylize(style = 1, color = 'gray') %>%
   opt_table_font(font = 'Arial')
@@ -7133,15 +7137,25 @@ cox.model.w.burden.strata <- update(cox.model.w.burden, . ~ . - `CANCER TYPE` + 
 ```{r, fig.height=8.5, fig.width=11}
 forest_model(
   cox.model.w.burden.strata,
-  format_options = list(point_size = 3),
+  format_options = list(point_size = 3, text_size = 6),
   panels = default_forest_panels(
     cox.model.w.burden.strata,
     factor_separate_line = FALSE,
     measure = "Hazard Ratio"
-  )
+  ),
+  recalculate_width = TRUE,
+  recalculate_height = FALSE
 ) +
-  labs(caption = "Stratified by cancer type")
-# ggsave("Figure S10.pdf", width = 11, height = 8.5, units = "in")
+  labs(title = "Cox Proportional Hazards Analysis of WGD Events and Patient Survival") +
+  theme(
+    plot.title = element_text(size = 22, face = 'bold'),
+    axis.text.x.bottom = element_text(
+      size = 12,
+      angle = -90,
+      vjust = 0.5
+    ),
+  )
+ggsave("Figure S10.png", width = 11, height = 8.5, units = "in")
 ```
 
 ### Figure S11
