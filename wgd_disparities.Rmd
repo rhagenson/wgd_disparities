@@ -4837,7 +4837,7 @@ tmp %>%
   theme_gray(base_size = 18)
 ```
 
-#### Figure S7E
+#### Figure S6E
 ```{r}
 tmp <- raw.data.wgd %>%
   # Keep only columns/variables of interest
@@ -4917,7 +4917,7 @@ ggplot(tmp) +
   )
 ```
 
-#### FIgure S7F
+#### FIgure S6F
 ```{r}
 tmp <- raw.data.wgd %>%
   # Keep only columns/variables of interest
