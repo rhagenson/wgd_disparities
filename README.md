@@ -1,5 +1,7 @@
 # An elevated rate of whole-genome duplication events in cancers from Black patients
 
+[![DOI](https://zenodo.org/badge/716301237.svg)](https://zenodo.org/doi/10.5281/zenodo.13134595)
+
 This repository represents the computational analysis for the investigation of WGD racial disparities as conducted in the Sheltzer Lab. The associated preprint is available on medRxiv at <https://doi.org/10.1101/2023.11.10.23298349>.
 
 ## Data Availability
